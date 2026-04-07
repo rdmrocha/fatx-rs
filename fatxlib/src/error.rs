@@ -38,6 +38,9 @@ pub enum FatxError {
     #[error("Invalid filename character: '{0}'")]
     InvalidFilenameChar(char),
 
+    #[error("File or directory already exists: {0}")]
+    FileExists(String),
+
     #[error("No free clusters available")]
     DiskFull,
 

@@ -34,6 +34,10 @@ pub struct FatxVolume<T: Read + Write + Seek> {
     partition_size: u64,
     /// Whether this volume uses big-endian on-disk format (Xbox 360 XTAF).
     big_endian: bool,
+    /// In-memory copy of the entire FAT for fast lookup and allocation.
+    fat_cache: Vec<u8>,
+    /// Whether the FAT cache has been modified and needs to be flushed.
+    fat_dirty: bool,
 }
 
 impl<T: Read + Write + Seek> FatxVolume<T> {
@@ -174,6 +178,25 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             partition_offset + data_offset,
         );
 
+        // Read the entire FAT into memory for fast lookup and allocation.
+        // On a 927 GB partition with 32 KB clusters this is ~120 MB — fits
+        // comfortably in RAM and eliminates millions of individual seeks.
+        let fat_abs = partition_offset + fat_offset;
+        let fat_aligned_start = fat_abs & !0x1FF;
+        let fat_pre_skip = (fat_abs - fat_aligned_start) as usize;
+        let fat_total = fat_pre_skip + fat_size as usize;
+        let fat_aligned_len = (fat_total + 511) & !511;
+
+        inner.seek(SeekFrom::Start(fat_aligned_start))?;
+        let mut fat_aligned_buf = vec![0u8; fat_aligned_len];
+        inner.read_exact(&mut fat_aligned_buf)?;
+        let fat_cache = fat_aligned_buf[fat_pre_skip..fat_pre_skip + fat_size as usize].to_vec();
+        info!(
+            "Loaded FAT into memory: {} bytes ({:.1} MB)",
+            fat_cache.len(),
+            fat_cache.len() as f64 / 1_048_576.0
+        );
+
         Ok(FatxVolume {
             inner,
             partition_offset,
@@ -185,6 +208,8 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             data_offset,
             partition_size,
             big_endian: is_xtaf,
+            fat_cache,
+            fat_dirty: false,
         })
     }
 
@@ -292,12 +317,14 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
     /// Read a single FAT entry for the given cluster.
     pub fn read_fat_entry(&mut self, cluster: u32) -> Result<FatEntry> {
-        let entry_offset = self.fat_offset + (cluster as u64) * self.fat_type.entry_size();
+        let cache_offset = (cluster as u64 * self.fat_type.entry_size()) as usize;
 
         match self.fat_type {
             FatType::Fat16 => {
-                let mut buf = [0u8; 2];
-                self.read_at(entry_offset, &mut buf)?;
+                let buf = [
+                    self.fat_cache[cache_offset],
+                    self.fat_cache[cache_offset + 1],
+                ];
                 let val = self.read_u16(&buf);
                 Ok(match val {
                     FAT16_FREE => FatEntry::Free,
@@ -307,8 +334,12 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                 })
             }
             FatType::Fat32 => {
-                let mut buf = [0u8; 4];
-                self.read_at(entry_offset, &mut buf)?;
+                let buf = [
+                    self.fat_cache[cache_offset],
+                    self.fat_cache[cache_offset + 1],
+                    self.fat_cache[cache_offset + 2],
+                    self.fat_cache[cache_offset + 3],
+                ];
                 let val = self.read_u32(&buf);
                 Ok(match val {
                     FAT32_FREE => FatEntry::Free,
@@ -320,9 +351,10 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         }
     }
 
-    /// Write a FAT entry for the given cluster.
+    /// Write a FAT entry for the given cluster (updates in-memory cache).
+    /// Changes are flushed to disk when `flush()` is called.
     pub fn write_fat_entry(&mut self, cluster: u32, entry: FatEntry) -> Result<()> {
-        let entry_offset = self.fat_offset + (cluster as u64) * self.fat_type.entry_size();
+        let cache_offset = (cluster as u64 * self.fat_type.entry_size()) as usize;
 
         match self.fat_type {
             FatType::Fat16 => {
@@ -332,7 +364,9 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                     FatEntry::Bad => FAT16_BAD,
                     FatEntry::Next(c) => c as u16,
                 };
-                self.write_at(entry_offset, &self.write_u16_bytes(val))?;
+                let bytes = self.write_u16_bytes(val);
+                self.fat_cache[cache_offset] = bytes[0];
+                self.fat_cache[cache_offset + 1] = bytes[1];
             }
             FatType::Fat32 => {
                 let val: u32 = match entry {
@@ -341,9 +375,14 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                     FatEntry::Bad => FAT32_BAD,
                     FatEntry::Next(c) => c,
                 };
-                self.write_at(entry_offset, &self.write_u32_bytes(val))?;
+                let bytes = self.write_u32_bytes(val);
+                self.fat_cache[cache_offset] = bytes[0];
+                self.fat_cache[cache_offset + 1] = bytes[1];
+                self.fat_cache[cache_offset + 2] = bytes[2];
+                self.fat_cache[cache_offset + 3] = bytes[3];
             }
         }
+        self.fat_dirty = true;
         Ok(())
     }
 
@@ -415,9 +454,30 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
     /// Free all clusters in a chain starting at `start_cluster`.
     pub fn free_chain(&mut self, start_cluster: u32) -> Result<()> {
-        let chain = self.read_chain(start_cluster)?;
-        for cluster in chain {
-            self.write_fat_entry(cluster, FatEntry::Free)?;
+        // Tolerant chain walk: free clusters until we hit end-of-chain,
+        // a free cluster, or a bad cluster. This handles corrupt chains
+        // from interrupted writes gracefully.
+        let mut current = start_cluster;
+        let max_iters = self.total_clusters as usize + 1;
+
+        for _ in 0..max_iters {
+            let entry = self.read_fat_entry(current)?;
+            self.write_fat_entry(current, FatEntry::Free)?;
+            match entry {
+                FatEntry::Next(next) => current = next,
+                FatEntry::EndOfChain => break,
+                FatEntry::Free => {
+                    warn!(
+                        "free_chain: hit already-free cluster at {}, stopping",
+                        current
+                    );
+                    break;
+                }
+                FatEntry::Bad => {
+                    warn!("free_chain: hit bad cluster at {}, stopping", current);
+                    break;
+                }
+            }
         }
         Ok(())
     }
@@ -813,6 +873,11 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         let (parent_path, dirname) = split_path(path);
         Self::validate_filename(dirname)?;
 
+        // Check if it already exists
+        if self.resolve_path(path).is_ok() {
+            return Err(FatxError::FileExists(path.to_string()));
+        }
+
         let parent = self.resolve_path(parent_path)?;
         if !parent.attributes.contains(FileAttributes::DIRECTORY) {
             return Err(FatxError::NotADirectory(parent_path.to_string()));
@@ -877,14 +942,119 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             }
         }
 
-        // Free the cluster chain
-        self.free_chain(target.first_cluster)?;
+        // Free the cluster chain (tolerant — continues even if chain is corrupt)
+        if let Err(e) = self.free_chain(target.first_cluster) {
+            warn!("delete '{}': failed to free chain: {}", path, e);
+        }
 
         // Mark the directory entry as deleted
         self.mark_dirent_deleted(parent.first_cluster, target_name)?;
 
         info!("Deleted '{}'", path);
         Ok(())
+    }
+
+    /// Recursively delete a file or directory and all its contents.
+    /// Tolerates corrupt chains from interrupted writes.
+    pub fn delete_recursive(&mut self, path: &str) -> Result<()> {
+        let target = self.resolve_path(path)?;
+
+        if target.is_directory() {
+            // Tolerate corrupt directory reads
+            match self.read_directory(target.first_cluster) {
+                Ok(contents) => {
+                    for entry in &contents {
+                        let child_path = if path == "/" {
+                            format!("/{}", entry.filename())
+                        } else {
+                            format!("{}/{}", path, entry.filename())
+                        };
+                        if let Err(e) = self.delete_recursive(&child_path) {
+                            warn!("delete_recursive: skipping '{}': {}", child_path, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "delete_recursive: cannot read directory '{}': {}, will still delete entry",
+                        path, e
+                    );
+                }
+            }
+        }
+
+        // delete() calls free_chain (now tolerant) then marks dirent deleted
+        self.delete(path)
+    }
+
+    /// Recursively copy a local directory tree into the FATX volume.
+    /// Opens volume once and writes all files/dirs in a single session.
+    #[allow(clippy::type_complexity)]
+    pub fn copy_from_host(
+        &mut self,
+        local_path: &std::path::Path,
+        dest_path: &str,
+        progress: Option<&dyn Fn(&str, u64, u64)>,
+    ) -> Result<(usize, usize, u64)> {
+        use std::fs;
+
+        let mut file_count = 0usize;
+        let mut dir_count = 0usize;
+        let mut total_bytes = 0u64;
+
+        // Create destination directory
+        match self.create_directory(dest_path) {
+            Ok(_) => {}
+            Err(FatxError::FileExists(_)) => {} // already exists, fine
+            Err(e) => return Err(e),
+        }
+        dir_count += 1;
+
+        // Read local directory entries
+        let entries = fs::read_dir(local_path).map_err(|e| {
+            FatxError::Io(std::io::Error::other(format!(
+                "Cannot read local dir '{}': {}",
+                local_path.display(),
+                e
+            )))
+        })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| FatxError::Io(std::io::Error::other(e.to_string())))?;
+            let local_child = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let fatx_child = if dest_path == "/" {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", dest_path, name)
+            };
+
+            if local_child.is_dir() {
+                let (fc, dc, tb) = self.copy_from_host(&local_child, &fatx_child, progress)?;
+                file_count += fc;
+                dir_count += dc;
+                total_bytes += tb;
+            } else if local_child.is_file() {
+                let data = fs::read(&local_child).map_err(|e| {
+                    FatxError::Io(std::io::Error::other(format!(
+                        "Cannot read '{}': {}",
+                        local_child.display(),
+                        e
+                    )))
+                })?;
+                let file_size = data.len() as u64;
+
+                if let Some(cb) = &progress {
+                    cb(&fatx_child, file_size, total_bytes);
+                }
+
+                self.create_file(&fatx_child, &data)?;
+                file_count += 1;
+                total_bytes += file_size;
+            }
+        }
+
+        Ok((file_count, dir_count, total_bytes))
     }
 
     /// Find and mark a directory entry as deleted (set filename_len to 0xE5).
@@ -957,6 +1127,38 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
     /// Flush any buffered writes to the underlying device.
     pub fn flush(&mut self) -> Result<()> {
+        if self.fat_dirty {
+            // Write the entire FAT cache back to disk in one shot.
+            // Sector-align the write for raw device compatibility.
+            let fat_abs = self.partition_offset + self.fat_offset;
+            let aligned_start = fat_abs & !0x1FF;
+            let pre_skip = (fat_abs - aligned_start) as usize;
+
+            if pre_skip == 0 && self.fat_cache.len().is_multiple_of(512) {
+                // FAT is already sector-aligned — write directly
+                self.inner.seek(SeekFrom::Start(fat_abs))?;
+                self.inner.write_all(&self.fat_cache)?;
+            } else {
+                // Need read-modify-write at boundaries
+                let total = pre_skip + self.fat_cache.len();
+                let aligned_len = (total + 511) & !511;
+                let mut buf = vec![0u8; aligned_len];
+
+                // Read existing aligned data
+                self.inner.seek(SeekFrom::Start(aligned_start))?;
+                self.inner.read_exact(&mut buf)?;
+
+                // Overlay our FAT cache
+                buf[pre_skip..pre_skip + self.fat_cache.len()].copy_from_slice(&self.fat_cache);
+
+                // Write back
+                self.inner.seek(SeekFrom::Start(aligned_start))?;
+                self.inner.write_all(&buf)?;
+            }
+
+            self.fat_dirty = false;
+            info!("Flushed FAT cache to disk ({} bytes)", self.fat_cache.len());
+        }
         self.inner.flush()?;
         Ok(())
     }

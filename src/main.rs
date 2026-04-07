@@ -244,6 +244,33 @@ enum Commands {
         #[arg(long)]
         partition: Option<String>,
     },
+    /// Recursively copy a local directory into the FATX volume
+    Copy {
+        device: PathBuf,
+        /// Local source directory to copy from
+        #[arg(long, short = 'i')]
+        from: PathBuf,
+        /// Destination path on the FATX volume
+        #[arg(long, short = 'o')]
+        to: String,
+        #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
+        offset: u64,
+        #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
+        size: u64,
+        #[arg(long)]
+        partition: Option<String>,
+    },
+    /// Recursively delete a file or directory and all its contents
+    Rmr {
+        device: PathBuf,
+        path: String,
+        #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
+        offset: u64,
+        #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
+        size: u64,
+        #[arg(long)]
+        partition: Option<String>,
+    },
     /// Print a hex dump at a given offset (debugging)
     Hexdump {
         device: PathBuf,
@@ -1604,6 +1631,116 @@ fn main() {
             });
             vol.flush().unwrap();
             let msg = format!("Deleted '{}'", path);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&JsonSuccess {
+                        success: true,
+                        message: msg
+                    })
+                    .unwrap()
+                );
+            } else {
+                println!("{}", msg);
+            }
+        }
+
+        Some(Commands::Copy {
+            device,
+            from,
+            to,
+            offset,
+            size,
+            partition,
+        }) => {
+            let mut vol = open_volume(&device, &partition, offset, size);
+
+            if !from.is_dir() {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"error": format!("'{}' is not a directory", from.display())})
+                    );
+                    process::exit(0);
+                }
+                eprintln!("Error: '{}' is not a directory", from.display());
+                process::exit(1);
+            }
+
+            let start = std::time::Instant::now();
+            let progress_fn = |path: &str, file_size: u64, total: u64| {
+                if !json {
+                    eprintln!(
+                        "  [{:.1} MB] {} ({:.1} MB)",
+                        total as f64 / 1_048_576.0,
+                        path,
+                        file_size as f64 / 1_048_576.0
+                    );
+                }
+            };
+
+            let (files, dirs, bytes) = vol
+                .copy_from_host(&from, &to, Some(&progress_fn))
+                .unwrap_or_else(|e| {
+                    if json {
+                        println!("{}", serde_json::json!({"error": format!("{}", e)}));
+                        process::exit(0);
+                    }
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
+                });
+            vol.flush().unwrap();
+
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 {
+                bytes as f64 / elapsed / 1_048_576.0
+            } else {
+                0.0
+            };
+            let msg = format!(
+                "Copied {} files, {} dirs ({:.1} MB) in {:.1}s ({:.1} MB/s)",
+                files,
+                dirs,
+                bytes as f64 / 1_048_576.0,
+                elapsed,
+                rate
+            );
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "success": true,
+                        "message": msg,
+                        "files": files,
+                        "directories": dirs,
+                        "bytes": bytes,
+                        "elapsed_seconds": elapsed,
+                        "rate_mbps": rate
+                    })
+                );
+            } else {
+                println!("{}", msg);
+            }
+        }
+
+        Some(Commands::Rmr {
+            device,
+            path,
+            offset,
+            size,
+            partition,
+        }) => {
+            let mut vol = open_volume(&device, &partition, offset, size);
+            vol.delete_recursive(&path).unwrap_or_else(|e| {
+                if json {
+                    println!("{}", serde_json::json!({"error": format!("{}", e)}));
+                    process::exit(0);
+                }
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            });
+            vol.flush().unwrap();
+            let msg = format!("Recursively deleted '{}'", path);
             if json {
                 println!(
                     "{}",
