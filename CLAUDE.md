@@ -21,6 +21,8 @@ Rust program for reading/writing FATX/XTAF file systems on Xbox/Xbox 360 formatt
 - FAT16 (< 65,520 clusters) vs FAT32 (larger partitions)
 - FAT size rounded UP to 4KB boundary
 - Xbox 360 partition offsets: Game Content @ 0x80080000, Data @ 0x130EB0000
+- **XTAF cluster count**: Xbox 360 uses `(partition_size - superblock) / cluster_size` — it does NOT subtract FAT space. Using the wrong formula shifts data_offset on large partitions.
+- **XTAF timestamp layout**: Directory entry offsets 52-55 store `date(2) + time(2)` (date first), whereas FATX stores `time(2) + date(2)` (time first). Same packed FAT format, just swapped field order. Timestamps are stored in UTC.
 
 ### macOS Raw Device I/O
 - Raw devices (`/dev/rdiskN`) require ALL I/O to be 512-byte sector-aligned

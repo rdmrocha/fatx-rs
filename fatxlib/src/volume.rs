@@ -444,12 +444,23 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         filename_raw.copy_from_slice(&buf[2..2 + MAX_FILENAME_LEN]);
         let first_cluster = self.read_u32(&[buf[44], buf[45], buf[46], buf[47]]);
         let file_size = self.read_u32(&[buf[48], buf[49], buf[50], buf[51]]);
-        let creation_time = self.read_u16(&[buf[52], buf[53]]);
-        let creation_date = self.read_u16(&[buf[54], buf[55]]);
-        let write_time = self.read_u16(&[buf[56], buf[57]]);
-        let write_date = self.read_u16(&[buf[58], buf[59]]);
-        let access_time = self.read_u16(&[buf[60], buf[61]]);
-        let access_date = self.read_u16(&[buf[62], buf[63]]);
+        // XTAF (Xbox 360) stores timestamps as date-then-time at each pair of offsets,
+        // while original FATX stores time-then-date. Both are 2-byte fields.
+        let (creation_time, creation_date) = if self.big_endian {
+            (self.read_u16(&[buf[54], buf[55]]), self.read_u16(&[buf[52], buf[53]]))
+        } else {
+            (self.read_u16(&[buf[52], buf[53]]), self.read_u16(&[buf[54], buf[55]]))
+        };
+        let (write_time, write_date) = if self.big_endian {
+            (self.read_u16(&[buf[58], buf[59]]), self.read_u16(&[buf[56], buf[57]]))
+        } else {
+            (self.read_u16(&[buf[56], buf[57]]), self.read_u16(&[buf[58], buf[59]]))
+        };
+        let (access_time, access_date) = if self.big_endian {
+            (self.read_u16(&[buf[62], buf[63]]), self.read_u16(&[buf[60], buf[61]]))
+        } else {
+            (self.read_u16(&[buf[60], buf[61]]), self.read_u16(&[buf[62], buf[63]]))
+        };
 
         Ok(DirectoryEntry {
             filename_len,
@@ -612,12 +623,22 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         buf[2..2 + MAX_FILENAME_LEN].copy_from_slice(&entry.filename_raw);
         buf[44..48].copy_from_slice(&self.write_u32_bytes(entry.first_cluster));
         buf[48..52].copy_from_slice(&self.write_u32_bytes(entry.file_size));
-        buf[52..54].copy_from_slice(&self.write_u16_bytes(entry.creation_time));
-        buf[54..56].copy_from_slice(&self.write_u16_bytes(entry.creation_date));
-        buf[56..58].copy_from_slice(&self.write_u16_bytes(entry.write_time));
-        buf[58..60].copy_from_slice(&self.write_u16_bytes(entry.write_date));
-        buf[60..62].copy_from_slice(&self.write_u16_bytes(entry.access_time));
-        buf[62..64].copy_from_slice(&self.write_u16_bytes(entry.access_date));
+        // XTAF stores date-then-time; FATX stores time-then-date
+        if self.big_endian {
+            buf[52..54].copy_from_slice(&self.write_u16_bytes(entry.creation_date));
+            buf[54..56].copy_from_slice(&self.write_u16_bytes(entry.creation_time));
+            buf[56..58].copy_from_slice(&self.write_u16_bytes(entry.write_date));
+            buf[58..60].copy_from_slice(&self.write_u16_bytes(entry.write_time));
+            buf[60..62].copy_from_slice(&self.write_u16_bytes(entry.access_date));
+            buf[62..64].copy_from_slice(&self.write_u16_bytes(entry.access_time));
+        } else {
+            buf[52..54].copy_from_slice(&self.write_u16_bytes(entry.creation_time));
+            buf[54..56].copy_from_slice(&self.write_u16_bytes(entry.creation_date));
+            buf[56..58].copy_from_slice(&self.write_u16_bytes(entry.write_time));
+            buf[58..60].copy_from_slice(&self.write_u16_bytes(entry.write_date));
+            buf[60..62].copy_from_slice(&self.write_u16_bytes(entry.access_time));
+            buf[62..64].copy_from_slice(&self.write_u16_bytes(entry.access_date));
+        }
         buf
     }
 
