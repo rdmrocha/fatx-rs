@@ -282,6 +282,13 @@ impl DirectoryEntry {
         format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, h, min, s)
     }
 
+    /// Format the last-access datetime as a human-readable string.
+    pub fn access_datetime_str(&self) -> String {
+        let (y, m, d) = Self::decode_date(self.access_date);
+        let (h, min, s) = Self::decode_time(self.access_time);
+        format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, h, min, s)
+    }
+
     /// Encode a (year, month, day) into packed FAT date format.
     pub fn encode_date(year: u16, month: u8, day: u8) -> u16 {
         let y = (year.saturating_sub(1980) & 0x7F) as u16;

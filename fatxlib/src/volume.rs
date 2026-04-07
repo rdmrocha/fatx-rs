@@ -32,6 +32,8 @@ pub struct FatxVolume<T: Read + Write + Seek> {
     data_offset: u64,
     /// Total size of this partition in bytes.
     partition_size: u64,
+    /// Whether this volume uses big-endian on-disk format (Xbox 360 XTAF).
+    big_endian: bool,
 }
 
 impl<T: Read + Write + Seek> FatxVolume<T> {
@@ -70,9 +72,22 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             return Err(FatxError::BadMagic(magic));
         }
 
-        let volume_id = u32::from_le_bytes([sb_buf[4], sb_buf[5], sb_buf[6], sb_buf[7]]);
-        let sectors_per_cluster = u32::from_le_bytes([sb_buf[8], sb_buf[9], sb_buf[10], sb_buf[11]]);
-        let fat_copies = u16::from_le_bytes([sb_buf[12], sb_buf[13]]);
+        // Xbox 360 XTAF uses big-endian for superblock fields;
+        // original Xbox FATX uses little-endian.
+        let is_xtaf = &magic == b"XTAF";
+        let (volume_id, sectors_per_cluster, fat_copies) = if is_xtaf {
+            (
+                u32::from_be_bytes([sb_buf[4], sb_buf[5], sb_buf[6], sb_buf[7]]),
+                u32::from_be_bytes([sb_buf[8], sb_buf[9], sb_buf[10], sb_buf[11]]),
+                u16::from_be_bytes([sb_buf[12], sb_buf[13]]),
+            )
+        } else {
+            (
+                u32::from_le_bytes([sb_buf[4], sb_buf[5], sb_buf[6], sb_buf[7]]),
+                u32::from_le_bytes([sb_buf[8], sb_buf[9], sb_buf[10], sb_buf[11]]),
+                u16::from_le_bytes([sb_buf[12], sb_buf[13]]),
+            )
+        };
 
         // Validate sectors_per_cluster (must be a power of 2, typically 1..128)
         if sectors_per_cluster == 0
@@ -118,15 +133,22 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
         let entry_size = fat_type.entry_size();
 
-        // Calculate cluster count and FAT size iteratively:
-        // FAT entries cover all data clusters. Data starts after FAT.
-        // fat_sectors = ceil(total_clusters * entry_size / SECTOR_SIZE)
-        // total_clusters = (total_sectors - fat_sectors) / spc
-        // We solve: total_clusters = (total_sectors * SECTOR_SIZE - total_clusters * entry_size) / cluster_size
-        //         = total_sectors / spc - total_clusters * entry_size / cluster_size
-        // => total_clusters * (1 + entry_size / cluster_size) = total_sectors / spc
-        // => total_clusters = total_sectors / (spc + entry_size / SECTOR_SIZE)  [approximately]
-        let total_clusters = (total_sectors * SECTOR_SIZE / (cluster_size + entry_size)) as u32;
+        // Calculate cluster count and FAT size.
+        //
+        // The Xbox 360 XTAF driver uses a naive formula that does NOT subtract
+        // FAT space from the cluster count:
+        //     total_clusters = (partition_size - superblock) / cluster_size
+        //
+        // The original Xbox FATX driver subtracts FAT overhead:
+        //     total_clusters ≈ total_data_bytes / (cluster_size + entry_size)
+        //
+        // Using the wrong formula shifts the data_offset and causes the root
+        // directory (and all data) to be read from the wrong location.
+        let total_clusters = if is_xtaf {
+            ((partition_size - SUPERBLOCK_SIZE) / cluster_size) as u32
+        } else {
+            (total_sectors * SECTOR_SIZE / (cluster_size + entry_size)) as u32
+        };
         let raw_fat_size = total_clusters as u64 * entry_size;
 
         // Round FAT size UP to 4KB boundary (as the original driver does)
@@ -158,7 +180,36 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             fat_size,
             data_offset,
             partition_size,
+            big_endian: is_xtaf,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Endian-aware integer helpers
+    // -----------------------------------------------------------------------
+
+    fn read_u16(&self, buf: &[u8]) -> u16 {
+        if self.big_endian {
+            u16::from_be_bytes([buf[0], buf[1]])
+        } else {
+            u16::from_le_bytes([buf[0], buf[1]])
+        }
+    }
+
+    fn read_u32(&self, buf: &[u8]) -> u32 {
+        if self.big_endian {
+            u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]])
+        } else {
+            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
+        }
+    }
+
+    fn write_u16_bytes(&self, val: u16) -> [u8; 2] {
+        if self.big_endian { val.to_be_bytes() } else { val.to_le_bytes() }
+    }
+
+    fn write_u32_bytes(&self, val: u32) -> [u8; 4] {
+        if self.big_endian { val.to_be_bytes() } else { val.to_le_bytes() }
     }
 
     // -----------------------------------------------------------------------
@@ -235,7 +286,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             FatType::Fat16 => {
                 let mut buf = [0u8; 2];
                 self.read_at(entry_offset, &mut buf)?;
-                let val = u16::from_le_bytes(buf);
+                let val = self.read_u16(&buf);
                 Ok(match val {
                     FAT16_FREE => FatEntry::Free,
                     FAT16_BAD => FatEntry::Bad,
@@ -246,7 +297,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             FatType::Fat32 => {
                 let mut buf = [0u8; 4];
                 self.read_at(entry_offset, &mut buf)?;
-                let val = u32::from_le_bytes(buf);
+                let val = self.read_u32(&buf);
                 Ok(match val {
                     FAT32_FREE => FatEntry::Free,
                     FAT32_BAD => FatEntry::Bad,
@@ -269,7 +320,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                     FatEntry::Bad => FAT16_BAD,
                     FatEntry::Next(c) => c as u16,
                 };
-                self.write_at(entry_offset, &val.to_le_bytes())?;
+                self.write_at(entry_offset, &self.write_u16_bytes(val))?;
             }
             FatType::Fat32 => {
                 let val: u32 = match entry {
@@ -278,7 +329,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                     FatEntry::Bad => FAT32_BAD,
                     FatEntry::Next(c) => c,
                 };
-                self.write_at(entry_offset, &val.to_le_bytes())?;
+                self.write_at(entry_offset, &self.write_u32_bytes(val))?;
             }
         }
         Ok(())
@@ -391,14 +442,14 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         let attributes = FileAttributes::from_bits_truncate(buf[1]);
         let mut filename_raw = [0u8; MAX_FILENAME_LEN];
         filename_raw.copy_from_slice(&buf[2..2 + MAX_FILENAME_LEN]);
-        let first_cluster = u32::from_le_bytes([buf[44], buf[45], buf[46], buf[47]]);
-        let file_size = u32::from_le_bytes([buf[48], buf[49], buf[50], buf[51]]);
-        let creation_time = u16::from_le_bytes([buf[52], buf[53]]);
-        let creation_date = u16::from_le_bytes([buf[54], buf[55]]);
-        let write_time = u16::from_le_bytes([buf[56], buf[57]]);
-        let write_date = u16::from_le_bytes([buf[58], buf[59]]);
-        let access_time = u16::from_le_bytes([buf[60], buf[61]]);
-        let access_date = u16::from_le_bytes([buf[62], buf[63]]);
+        let first_cluster = self.read_u32(&[buf[44], buf[45], buf[46], buf[47]]);
+        let file_size = self.read_u32(&[buf[48], buf[49], buf[50], buf[51]]);
+        let creation_time = self.read_u16(&[buf[52], buf[53]]);
+        let creation_date = self.read_u16(&[buf[54], buf[55]]);
+        let write_time = self.read_u16(&[buf[56], buf[57]]);
+        let write_date = self.read_u16(&[buf[58], buf[59]]);
+        let access_time = self.read_u16(&[buf[60], buf[61]]);
+        let access_date = self.read_u16(&[buf[62], buf[63]]);
 
         Ok(DirectoryEntry {
             filename_len,
@@ -554,19 +605,19 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
     }
 
     /// Serialize a DirectoryEntry back to its 64-byte on-disk form.
-    fn serialize_dirent(entry: &DirectoryEntry) -> [u8; DIRENT_SIZE] {
+    fn serialize_dirent(&self, entry: &DirectoryEntry) -> [u8; DIRENT_SIZE] {
         let mut buf = [0u8; DIRENT_SIZE];
         buf[0] = entry.filename_len;
         buf[1] = entry.attributes.bits();
         buf[2..2 + MAX_FILENAME_LEN].copy_from_slice(&entry.filename_raw);
-        buf[44..48].copy_from_slice(&entry.first_cluster.to_le_bytes());
-        buf[48..52].copy_from_slice(&entry.file_size.to_le_bytes());
-        buf[52..54].copy_from_slice(&entry.creation_time.to_le_bytes());
-        buf[54..56].copy_from_slice(&entry.creation_date.to_le_bytes());
-        buf[56..58].copy_from_slice(&entry.write_time.to_le_bytes());
-        buf[58..60].copy_from_slice(&entry.write_date.to_le_bytes());
-        buf[60..62].copy_from_slice(&entry.access_time.to_le_bytes());
-        buf[62..64].copy_from_slice(&entry.access_date.to_le_bytes());
+        buf[44..48].copy_from_slice(&self.write_u32_bytes(entry.first_cluster));
+        buf[48..52].copy_from_slice(&self.write_u32_bytes(entry.file_size));
+        buf[52..54].copy_from_slice(&self.write_u16_bytes(entry.creation_time));
+        buf[54..56].copy_from_slice(&self.write_u16_bytes(entry.creation_date));
+        buf[56..58].copy_from_slice(&self.write_u16_bytes(entry.write_time));
+        buf[58..60].copy_from_slice(&self.write_u16_bytes(entry.write_date));
+        buf[60..62].copy_from_slice(&self.write_u16_bytes(entry.access_time));
+        buf[62..64].copy_from_slice(&self.write_u16_bytes(entry.access_date));
         buf
     }
 
@@ -592,7 +643,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
                 if marker == DIRENT_END || marker == DIRENT_DELETED || marker == 0x00 {
                     // Found a free slot — write the entry
-                    let raw = Self::serialize_dirent(entry);
+                    let raw = self.serialize_dirent(entry);
                     self.write_at(slot_offset, &raw)?;
 
                     // If we overwrote an end marker and there's space after, write a new end marker
@@ -622,7 +673,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
         // Write the entry at the first slot of the new cluster
         let base_offset = self.cluster_offset(new_cluster)?;
-        let raw = Self::serialize_dirent(entry);
+        let raw = self.serialize_dirent(entry);
         self.write_at(base_offset, &raw)?;
 
         // Write end marker at slot 1

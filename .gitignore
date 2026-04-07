@@ -1,3 +1,7 @@
 /target
 *.DS_Store
 _git2_*
+.tmp/**
+.agent/response.json
+.agent/request.json
+.agent/processing

@@ -2,18 +2,23 @@
 //!
 //! Run with no arguments for interactive mode, or use subcommands directly:
 //!   fatx-cli                     # Interactive guided mode
+//!   fatx-cli browse /dev/rdisk4  # TUI file browser
 //!   fatx-cli scan /dev/rdisk4
 //!   fatx-cli ls /dev/rdisk4 --partition "Data (E)" /
+
+mod tui;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read as IoRead, Seek, SeekFrom, Write as IoWrite};
 use std::path::PathBuf;
 use std::process::{self, Command};
 
+use base64::Engine;
 use clap::{Parser, Subcommand};
 use fatxlib::partition::{detect_xbox_partitions, format_size, DetectedPartition};
 use fatxlib::types::FileAttributes;
 use fatxlib::volume::FatxVolume;
+use serde::Serialize;
 
 /// Get the size of a device, handling macOS raw block devices correctly.
 fn get_device_size(file: &mut File) -> u64 {
@@ -59,12 +64,94 @@ struct Cli {
     #[arg(short = 'v', long, global = true)]
     verbose: bool,
 
+    /// Output results as JSON (for programmatic use / MCP integration)
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
+// ---------------------------------------------------------------------------
+// JSON output types
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct JsonPartition {
+    name: String,
+    offset: u64,
+    offset_hex: String,
+    size: u64,
+    size_human: String,
+    has_valid_magic: bool,
+    magic: String,
+    generation: String,
+}
+
+#[derive(Serialize)]
+struct JsonDirEntry {
+    name: String,
+    is_directory: bool,
+    size: u64,
+    attributes: String,
+    first_cluster: u32,
+    created: String,
+    modified: String,
+    accessed: String,
+}
+
+#[derive(Serialize)]
+struct JsonVolumeInfo {
+    volume_id: String,
+    fat_type: String,
+    cluster_size: u64,
+    cluster_size_human: String,
+    total_clusters: u32,
+    used_clusters: u32,
+    free_clusters: u32,
+    bad_clusters: u32,
+    total_size: u64,
+    used_size: u64,
+    free_size: u64,
+    total_size_human: String,
+    used_size_human: String,
+    free_size_human: String,
+}
+
+#[derive(Serialize)]
+struct JsonHexdump {
+    offset: u64,
+    offset_hex: String,
+    count: usize,
+    data_base64: String,
+    data_hex: String,
+}
+
+#[derive(Serialize)]
+struct JsonFileContent {
+    path: String,
+    size: usize,
+    data_base64: String,
+}
+
+#[derive(Serialize)]
+struct JsonSuccess {
+    success: bool,
+    message: String,
+}
+
 #[derive(Subcommand)]
 enum Commands {
+    /// Interactive TUI file browser — navigate, download, and upload files
+    Browse {
+        device: PathBuf,
+        #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
+        offset: u64,
+        #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
+        size: u64,
+        #[arg(long)]
+        partition: Option<String>,
+    },
     /// Scan a device for FATX partitions at standard Xbox offsets
     Scan {
         device: PathBuf,
@@ -1073,6 +1160,26 @@ fn open_volume(
     })
 }
 
+fn dirent_to_json(entry: &fatxlib::types::DirectoryEntry) -> JsonDirEntry {
+    let attr = format!(
+        "{}{}{}{}",
+        if entry.is_directory() { "d" } else { "-" },
+        if entry.attributes.contains(FileAttributes::READ_ONLY) { "r" } else { "-" },
+        if entry.attributes.contains(FileAttributes::HIDDEN) { "h" } else { "-" },
+        if entry.attributes.contains(FileAttributes::SYSTEM) { "s" } else { "-" },
+    );
+    JsonDirEntry {
+        name: entry.filename(),
+        is_directory: entry.is_directory(),
+        size: entry.file_size as u64,
+        attributes: attr,
+        first_cluster: entry.first_cluster,
+        created: entry.creation_datetime_str(),
+        modified: entry.write_datetime_str(),
+        accessed: entry.access_datetime_str(),
+    }
+}
+
 fn print_entry(entry: &fatxlib::types::DirectoryEntry, long: bool) {
     let name = entry.filename();
     if long {
@@ -1121,28 +1228,60 @@ fn main() {
         log::debug!("Verbose mode enabled");
     }
 
+    let json = cli.json;
+
     match cli.command {
         None => interactive_mode(),
+
+        Some(Commands::Browse { device, offset, size, partition }) => {
+            let part_name = partition.clone().unwrap_or_else(|| "FATX Volume".to_string());
+            let mut vol = open_volume(&device, &partition, offset, size);
+            let dev_display = device.display().to_string();
+            if let Err(e) = tui::run_browser(&mut vol, &part_name, &dev_display) {
+                eprintln!("TUI error: {}", e);
+                process::exit(1);
+            }
+        }
 
         Some(Commands::Scan { device, deep, deep_limit }) => {
             let mut file = OpenOptions::new().read(true).write(true).open(&device)
                 .unwrap_or_else(|e| { eprintln!("Error: {}", e); process::exit(1); });
-            println!("Scanning {} for FATX/XTAF partitions...\n", device.display());
+            if !json { println!("Scanning {} for FATX/XTAF partitions...\n", device.display()); }
             let dev_size = get_device_size(&mut file);
             match detect_xbox_partitions(&mut file, dev_size) {
                 Ok(parts) => {
-                    println!("{:<25} {:>14} {:>10} {:>6} {}", "Partition", "Offset", "Size", "Magic", "Console");
-                    println!("{}", "-".repeat(75));
-                    for p in &parts {
-                        let magic_str = if p.has_valid_magic { p.magic.as_str() } else { "--" };
-                        let gen_str = if p.has_valid_magic { format!("{}", p.generation) } else { String::new() };
-                        println!("{:<25} 0x{:010X}   {:>10} {:>6} {}",
-                            p.name, p.offset, format_size(p.size), magic_str, gen_str);
+                    if json {
+                        let jp: Vec<JsonPartition> = parts.iter().map(|p| JsonPartition {
+                            name: p.name.clone(),
+                            offset: p.offset,
+                            offset_hex: format!("0x{:X}", p.offset),
+                            size: p.size,
+                            size_human: format_size(p.size),
+                            has_valid_magic: p.has_valid_magic,
+                            magic: if p.has_valid_magic { p.magic.clone() } else { String::new() },
+                            generation: if p.has_valid_magic { format!("{}", p.generation) } else { String::new() },
+                        }).collect();
+                        println!("{}", serde_json::to_string_pretty(&jp).unwrap());
+                    } else {
+                        println!("{:<25} {:>14} {:>10} {:>6} {}", "Partition", "Offset", "Size", "Magic", "Console");
+                        println!("{}", "-".repeat(75));
+                        for p in &parts {
+                            let magic_str = if p.has_valid_magic { p.magic.as_str() } else { "--" };
+                            let gen_str = if p.has_valid_magic { format!("{}", p.generation) } else { String::new() };
+                            println!("{:<25} 0x{:010X}   {:>10} {:>6} {}",
+                                p.name, p.offset, format_size(p.size), magic_str, gen_str);
+                        }
                     }
                 }
-                Err(e) => eprintln!("Error: {}", e),
+                Err(e) => {
+                    if json {
+                        println!("{}", serde_json::json!({"error": format!("{}", e)}));
+                    } else {
+                        eprintln!("Error: {}", e);
+                    }
+                }
             }
-            if deep {
+            if deep && !json {
                 println!("\nDeep scanning up to 0x{:X}...", deep_limit);
                 match fatxlib::partition::scan_for_fatx(&mut file, deep_limit) {
                     Ok(offsets) => {
@@ -1157,113 +1296,194 @@ fn main() {
         Some(Commands::Ls { device, path, offset, size, partition, long }) => {
             let mut vol = open_volume(&device, &partition, offset, size);
             let entry = vol.resolve_path(&path).unwrap_or_else(|e| {
+                if json { println!("{}", serde_json::json!({"error": format!("{}", e)})); process::exit(0); }
                 eprintln!("Error: {}", e); process::exit(1);
             });
-            if !entry.is_directory() { print_entry(&entry, long); return; }
-            let entries = vol.read_directory(entry.first_cluster).unwrap_or_else(|e| {
-                eprintln!("Error: {}", e); process::exit(1);
-            });
-            if entries.is_empty() { println!("(empty)"); return; }
-            if long {
-                println!("{:<6} {:>12} {:<20} {}", "Attr", "Size", "Modified", "Name");
-                println!("{}", "-".repeat(65));
+            if !entry.is_directory() {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&[dirent_to_json(&entry)]).unwrap());
+                } else {
+                    print_entry(&entry, long);
+                }
+                return;
             }
-            for e in &entries { print_entry(e, long); }
+            let entries = vol.read_directory(entry.first_cluster).unwrap_or_else(|e| {
+                if json { println!("{}", serde_json::json!({"error": format!("{}", e)})); process::exit(0); }
+                eprintln!("Error: {}", e); process::exit(1);
+            });
+            if json {
+                let je: Vec<JsonDirEntry> = entries.iter().map(|e| dirent_to_json(e)).collect();
+                println!("{}", serde_json::to_string_pretty(&je).unwrap());
+            } else {
+                if entries.is_empty() { println!("(empty)"); return; }
+                if long {
+                    println!("{:<6} {:>12} {:<20} {}", "Attr", "Size", "Modified", "Name");
+                    println!("{}", "-".repeat(65));
+                }
+                for e in &entries { print_entry(e, long); }
+            }
         }
 
         Some(Commands::Read { device, path, output, offset, size, partition }) => {
             let mut vol = open_volume(&device, &partition, offset, size);
             let data = vol.read_file_by_path(&path).unwrap_or_else(|e| {
+                if json { println!("{}", serde_json::json!({"error": format!("{}", e)})); process::exit(0); }
                 eprintln!("Error: {}", e); process::exit(1);
             });
-            match output {
-                Some(out) => {
-                    fs::write(&out, &data).unwrap_or_else(|e| {
-                        eprintln!("Error: {}", e); process::exit(1);
-                    });
-                    println!("Extracted '{}' -> '{}' ({} bytes)", path, out.display(), data.len());
+            if json {
+                let jf = JsonFileContent {
+                    path: path.clone(),
+                    size: data.len(),
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(&data),
+                };
+                println!("{}", serde_json::to_string_pretty(&jf).unwrap());
+            } else {
+                match output {
+                    Some(out) => {
+                        fs::write(&out, &data).unwrap_or_else(|e| {
+                            eprintln!("Error: {}", e); process::exit(1);
+                        });
+                        println!("Extracted '{}' -> '{}' ({} bytes)", path, out.display(), data.len());
+                    }
+                    None => { io::stdout().write_all(&data).unwrap(); }
                 }
-                None => { io::stdout().write_all(&data).unwrap(); }
             }
         }
 
         Some(Commands::Write { device, path, input, offset, size, partition }) => {
             let mut vol = open_volume(&device, &partition, offset, size);
             let data = fs::read(&input).unwrap_or_else(|e| {
+                if json { println!("{}", serde_json::json!({"error": format!("{}", e)})); process::exit(0); }
                 eprintln!("Error: {}", e); process::exit(1);
             });
             vol.create_file(&path, &data).unwrap_or_else(|e| {
+                if json { println!("{}", serde_json::json!({"error": format!("{}", e)})); process::exit(0); }
                 eprintln!("Error: {}", e); process::exit(1);
             });
             vol.flush().unwrap();
-            println!("Wrote '{}' -> '{}' ({} bytes)", input.display(), path, data.len());
+            let msg = format!("Wrote '{}' -> '{}' ({} bytes)", input.display(), path, data.len());
+            if json { println!("{}", serde_json::to_string(&JsonSuccess { success: true, message: msg }).unwrap()); }
+            else { println!("{}", msg); }
         }
 
         Some(Commands::Mkdir { device, path, offset, size, partition }) => {
             let mut vol = open_volume(&device, &partition, offset, size);
             vol.create_directory(&path).unwrap_or_else(|e| {
+                if json { println!("{}", serde_json::json!({"error": format!("{}", e)})); process::exit(0); }
                 eprintln!("Error: {}", e); process::exit(1);
             });
             vol.flush().unwrap();
-            println!("Created '{}'", path);
+            let msg = format!("Created '{}'", path);
+            if json { println!("{}", serde_json::to_string(&JsonSuccess { success: true, message: msg }).unwrap()); }
+            else { println!("{}", msg); }
         }
 
         Some(Commands::Rm { device, path, offset, size, partition }) => {
             let mut vol = open_volume(&device, &partition, offset, size);
             vol.delete(&path).unwrap_or_else(|e| {
+                if json { println!("{}", serde_json::json!({"error": format!("{}", e)})); process::exit(0); }
                 eprintln!("Error: {}", e); process::exit(1);
             });
             vol.flush().unwrap();
-            println!("Deleted '{}'", path);
+            let msg = format!("Deleted '{}'", path);
+            if json { println!("{}", serde_json::to_string(&JsonSuccess { success: true, message: msg }).unwrap()); }
+            else { println!("{}", msg); }
         }
 
         Some(Commands::Rename { device, path, new_name, offset, size, partition }) => {
             let mut vol = open_volume(&device, &partition, offset, size);
             vol.rename(&path, &new_name).unwrap_or_else(|e| {
+                if json { println!("{}", serde_json::json!({"error": format!("{}", e)})); process::exit(0); }
                 eprintln!("Error: {}", e); process::exit(1);
             });
             vol.flush().unwrap();
-            println!("Renamed '{}' -> '{}'", path, new_name);
+            let msg = format!("Renamed '{}' -> '{}'", path, new_name);
+            if json { println!("{}", serde_json::to_string(&JsonSuccess { success: true, message: msg }).unwrap()); }
+            else { println!("{}", msg); }
         }
 
         Some(Commands::Info { device, offset, size, partition }) => {
             let mut vol = open_volume(&device, &partition, offset, size);
-            println!("FATX Volume Information");
-            println!("=======================");
-            println!("Volume ID:          0x{:08X}", vol.superblock.volume_id);
-            println!("FAT type:           {}", vol.fat_type);
-            println!("Cluster size:       {}", format_size(vol.superblock.cluster_size()));
-            println!("Total clusters:     {}", vol.total_clusters);
-            if let Ok(stats) = vol.stats() {
-                println!("\nUsed:  {} ({} clusters)", format_size(stats.used_size), stats.used_clusters);
-                println!("Free:  {} ({} clusters)", format_size(stats.free_size), stats.free_clusters);
+            if json {
+                let stats = vol.stats().unwrap_or_else(|e| {
+                    println!("{}", serde_json::json!({"error": format!("{}", e)}));
+                    process::exit(0);
+                });
+                let ji = JsonVolumeInfo {
+                    volume_id: format!("0x{:08X}", vol.superblock.volume_id),
+                    fat_type: format!("{}", vol.fat_type),
+                    cluster_size: vol.superblock.cluster_size(),
+                    cluster_size_human: format_size(vol.superblock.cluster_size()),
+                    total_clusters: vol.total_clusters,
+                    used_clusters: stats.used_clusters,
+                    free_clusters: stats.free_clusters,
+                    bad_clusters: stats.bad_clusters,
+                    total_size: stats.total_size,
+                    used_size: stats.used_size,
+                    free_size: stats.free_size,
+                    total_size_human: format_size(stats.total_size),
+                    used_size_human: format_size(stats.used_size),
+                    free_size_human: format_size(stats.free_size),
+                };
+                println!("{}", serde_json::to_string_pretty(&ji).unwrap());
+            } else {
+                println!("FATX Volume Information");
+                println!("=======================");
+                println!("Volume ID:          0x{:08X}", vol.superblock.volume_id);
+                println!("FAT type:           {}", vol.fat_type);
+                println!("Cluster size:       {}", format_size(vol.superblock.cluster_size()));
+                println!("Total clusters:     {}", vol.total_clusters);
+                if let Ok(stats) = vol.stats() {
+                    println!("\nUsed:  {} ({} clusters)", format_size(stats.used_size), stats.used_clusters);
+                    println!("Free:  {} ({} clusters)", format_size(stats.free_size), stats.free_clusters);
+                }
             }
         }
 
         Some(Commands::Hexdump { device, offset, count }) => {
             let mut file = OpenOptions::new().read(true).open(&device)
                 .unwrap_or_else(|e| { eprintln!("Error: {}", e); process::exit(1); });
-            file.seek(SeekFrom::Start(offset)).unwrap();
-            let mut buf = vec![0u8; count];
-            file.read_exact(&mut buf).unwrap_or_else(|e| {
+
+            // Sector-align for macOS raw devices
+            let sector_start = offset & !0x1FF;
+            let pre_skip = (offset - sector_start) as usize;
+            let aligned_len = (pre_skip + count + 511) & !511;
+
+            file.seek(SeekFrom::Start(sector_start)).unwrap();
+            let mut aligned_buf = vec![0u8; aligned_len];
+            file.read_exact(&mut aligned_buf).unwrap_or_else(|e| {
+                if json { println!("{}", serde_json::json!({"error": format!("{}", e)})); process::exit(0); }
                 eprintln!("Error: {}", e); process::exit(1);
             });
-            println!("Offset 0x{:08X}, {} bytes:", offset, count);
-            for (i, chunk) in buf.chunks(16).enumerate() {
-                let addr = offset + (i * 16) as u64;
-                print!("{:08X}  ", addr);
-                for (j, b) in chunk.iter().enumerate() {
-                    print!("{:02X} ", b);
-                    if j == 7 { print!(" "); }
+            let buf = &aligned_buf[pre_skip..pre_skip + count];
+
+            if json {
+                let jh = JsonHexdump {
+                    offset,
+                    offset_hex: format!("0x{:08X}", offset),
+                    count,
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(buf),
+                    data_hex: hex::encode(buf),
+                };
+                println!("{}", serde_json::to_string_pretty(&jh).unwrap());
+            } else {
+                println!("Offset 0x{:08X}, {} bytes:", offset, count);
+                for (i, chunk) in buf.chunks(16).enumerate() {
+                    let addr = offset + (i * 16) as u64;
+                    print!("{:08X}  ", addr);
+                    for (j, b) in chunk.iter().enumerate() {
+                        print!("{:02X} ", b);
+                        if j == 7 { print!(" "); }
+                    }
+                    if chunk.len() < 16 {
+                        for j in chunk.len()..16 { print!("   "); if j == 7 { print!(" "); } }
+                    }
+                    print!(" |");
+                    for b in chunk {
+                        print!("{}", if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' });
+                    }
+                    println!("|");
                 }
-                if chunk.len() < 16 {
-                    for j in chunk.len()..16 { print!("   "); if j == 7 { print!(" "); } }
-                }
-                print!(" |");
-                for b in chunk {
-                    print!("{}", if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' });
-                }
-                println!("|");
             }
         }
     }
