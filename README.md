@@ -23,9 +23,31 @@ Both FAT16 and FAT32 variants are handled automatically based on cluster count.
 - Sector-aligned I/O for macOS raw block devices (`/dev/rdiskN`)
 - Endian-aware handling of all on-disk structures
 
-## Building
+## Install
 
-Requires Rust (stable). Build everything with:
+One-liner for macOS (downloads the latest release):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/joshuareisbord/fatx-rs/main/install.sh | bash
+```
+
+Or install a specific version:
+
+```bash
+FATX_VERSION=v0.2.1-alpha bash install.sh
+```
+
+### Build from Source
+
+Requires Rust (stable). Clone and run the setup script:
+
+```bash
+git clone https://github.com/joshuareisbord/fatx-rs.git
+cd fatx-rs
+bash setup.sh
+```
+
+Or build manually:
 
 ```bash
 cargo build --release

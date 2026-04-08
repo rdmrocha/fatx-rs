@@ -34,11 +34,30 @@ Rust toolkit for reading, writing, and mounting FATX/XTAF file systems on Xbox/X
 ### NFS Mount (fatx-mount)
 - Uses `tokio::task::spawn_blocking` for all FATX volume I/O — blocking USB reads must NOT run on the async event loop or the NFS server freezes
 - File data cache (`file_cache`) and directory cache (`dir_cache`) avoid redundant USB reads. NFS reads come in 128KB chunks; without caching, each chunk re-reads the entire file.
-- macOS metadata files (.DS_Store, ._, .Spotlight-V100, .Trashes, .fseventsd) are blocked from creation
+- Write buffering: NFS writes accumulate in `dirty_files` HashMap in memory (sub-millisecond). A periodic flush task (every 5s) batch-writes dirty files to disk and flushes the FAT. This prevents the catastrophic slowdown where each 128KB NFS chunk triggered a full file delete+recreate+231MB FAT flush.
+- macOS metadata files (.DS_Store, ._, .Spotlight-V100, .Trashes, .fseventsd) are allowed through (user decision: "just allow mac to have dsstore files, if it proves to be a problem we will address it later")
 - Mount options include `soft,intr,retrans=2,timeo=10` to prevent macOS from hanging on stale NFS mounts
 - **CRITICAL**: Shutdown must unmount BEFORE stopping the NFS server. If the server dies first, umount hangs, Finder freezes, and the user may need to reboot. The signal handler on a dedicated thread handles this.
 - Auto-mount is OFF by default (`--mount` to enable). This prevents stale mount disasters during development.
 - `--cleanup` flag kills stale mount_nfs processes and force-unmounts localhost NFS mounts
+
+### ⚠️ KNOWN CATASTROPHIC FAILURE: Stale NFS Mount Deadlock (2025-04-08)
+**Symptoms**: Finder won't launch. Force Quit doesn't list Finder. `open -a Finder` returns but Finder never appears. `sudo umount -f /Volumes/Xbox\ Drive` hangs. `ls /Volumes/` hangs. ANY command touching the mount path hangs. Even `sudo rm -rf` hangs.
+
+**Root Cause**: fatx-mount NFS server died (killed, crashed, or hung overnight during a long transfer) while Finder had the volume open. The kernel NFS client entered an uninterruptible wait (D-state) trying to talk to the dead server. Once in this state:
+1. Any process that touches the mount path blocks in the kernel (uninterruptible, cannot be killed)
+2. Finder tries to enumerate /Volumes/ on launch → blocked → never starts
+3. `umount -f` tries to access the mount → blocked
+4. Even `ls /Volumes/` blocks because it stats every entry including the dead mount
+5. macOS has no `umount -l` (lazy unmount) equivalent — **only a reboot clears it**
+
+**Key finding**: `/sbin/mount -t nfs` returned EMPTY (the mount was already gone from the mount table) but the mountpoint directory still caused kernel hangs. The stale *directory* at `/Volumes/Xbox Drive` was the problem, not a registered mount.
+
+**Prevention (MUST be implemented)**:
+1. Watchdog: if NFS write operations stall for >30s, auto-shutdown (unmount + exit)
+2. Startup cleanup: on launch, force-unmount and rm any leftover `/Volumes/Xbox Drive` before creating a new mount
+3. Heartbeat: periodic check that the mount is responsive; if not, trigger clean shutdown
+4. Never let the NFS server die without unmounting first — ALL exit paths must unmount
 
 ## Development Workflow
 
@@ -59,6 +78,15 @@ For NFS mount testing, use a file-backed test image instead of a real drive:
 fatx mkimage test.img --size 1G --populate
 sudo fatx mount test.img --trace
 ```
+
+### Bug-Driven Testing Rule
+**Every bug fix MUST include a regression test.** When a bug is found — whether from user reports, logs, or code review — write a test that reproduces the failure BEFORE fixing it, then verify the fix makes it pass. This applies to all crates. No exceptions. Claude should do this automatically without being asked.
+
+Test locations:
+- `fatxlib` bugs → `fatxlib/tests/integration.rs`
+- `fatx-mkimage` bugs → `fatx-mkimage/src/main.rs` (in `#[cfg(test)] mod tests`)
+- `fatx-mount` bugs → `fatx-mount/src/main.rs` (in `#[cfg(test)] mod tests`)
+- CLI bugs → `tests/cli_integration.rs`
 
 ### Agent (Claude ↔ Drive Bridge)
 A file-based RPC agent (`/.agent/agent.sh`) runs on the Mac with sudo, watching for `request.json`, executing `fatx --json`, and writing `response.json`. The sandbox helper is at `/sessions/zealous-busy-pascal/fatx-cmd.sh`. Agent state files are gitignored. When using shell scripts via the agent (placed in `.tmp/`), delete them after use to keep the directory clean.

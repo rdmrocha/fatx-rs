@@ -927,6 +927,133 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         Ok(())
     }
 
+    /// Write data to an existing file IN-PLACE, reusing its cluster chain.
+    ///
+    /// This is dramatically faster than delete+recreate for large files because:
+    /// - Existing clusters are overwritten directly (no FAT changes needed)
+    /// - Only NEWLY needed clusters trigger FAT allocations
+    /// - If the file shrank, excess clusters are freed
+    /// - The directory entry's file_size is updated on disk
+    ///
+    /// This method follows the same pattern as Linux's FAT32 driver: write data
+    /// directly to existing cluster offsets, extend the chain if the file grew,
+    /// and free tail clusters if it shrank. The FAT is only modified when the
+    /// cluster count actually changes.
+    pub fn write_file_in_place(&mut self, path: &str, data: &[u8]) -> Result<()> {
+        let (parent_path, filename) = split_path(path);
+        let parent = self.resolve_path(parent_path)?;
+        let target = self.resolve_path(path)?;
+
+        if target.is_directory() {
+            return Err(FatxError::IsADirectory(path.to_string()));
+        }
+
+        let cluster_size = self.superblock.cluster_size() as usize;
+        let clusters_needed = if data.is_empty() {
+            1
+        } else {
+            data.len().div_ceil(cluster_size)
+        };
+
+        // Read the existing cluster chain
+        let old_chain = self.read_chain(target.first_cluster)?;
+        let old_count = old_chain.len();
+
+        // ── Phase 1: Extend chain if file grew ──
+        if clusters_needed > old_count {
+            let extra = clusters_needed - old_count;
+            // Find the last cluster in the existing chain
+            let last_old = *old_chain.last().unwrap();
+
+            // Allocate additional clusters
+            let mut new_clusters = Vec::with_capacity(extra);
+            for cluster in FIRST_CLUSTER..(FIRST_CLUSTER + self.total_clusters) {
+                if let FatEntry::Free = self.read_fat_entry(cluster)? {
+                    new_clusters.push(cluster);
+                    if new_clusters.len() == extra {
+                        break;
+                    }
+                }
+            }
+            if new_clusters.len() < extra {
+                return Err(FatxError::DiskFull);
+            }
+
+            // Link: old_last -> new_clusters[0] -> ... -> EOC
+            self.write_fat_entry(last_old, FatEntry::Next(new_clusters[0]))?;
+            for i in 0..new_clusters.len() - 1 {
+                self.write_fat_entry(new_clusters[i], FatEntry::Next(new_clusters[i + 1]))?;
+            }
+            self.write_fat_entry(*new_clusters.last().unwrap(), FatEntry::EndOfChain)?;
+        }
+
+        // ── Phase 2: Write data to clusters ──
+        // Re-read chain (may have been extended)
+        let chain = self.read_chain(target.first_cluster)?;
+        let mut offset = 0;
+        for &cluster in chain.iter().take(clusters_needed) {
+            let end = (offset + cluster_size).min(data.len());
+            let mut cluster_buf = vec![0u8; cluster_size];
+            if offset < data.len() {
+                let len = end - offset;
+                cluster_buf[..len].copy_from_slice(&data[offset..end]);
+            }
+            self.write_cluster(cluster, &cluster_buf)?;
+            offset += cluster_size;
+        }
+
+        // ── Phase 3: Free excess clusters if file shrank ──
+        if clusters_needed < old_count {
+            // Mark the new last cluster as EOC
+            self.write_fat_entry(chain[clusters_needed - 1], FatEntry::EndOfChain)?;
+            // Free the tail
+            for &cluster in chain.iter().take(old_count).skip(clusters_needed) {
+                self.write_fat_entry(cluster, FatEntry::Free)?;
+            }
+        }
+
+        // ── Phase 4: Update directory entry file_size on disk ──
+        self.update_dirent_size(parent.first_cluster, filename, data.len() as u32)?;
+
+        info!(
+            "Wrote '{}' in-place ({} bytes, {} clusters, was {})",
+            filename,
+            data.len(),
+            clusters_needed,
+            old_count
+        );
+        Ok(())
+    }
+
+    /// Update the file_size field of a directory entry on disk.
+    /// Finds the entry by name in the parent directory and writes only the
+    /// 4-byte size field, leaving everything else untouched.
+    fn update_dirent_size(&mut self, parent_cluster: u32, name: &str, new_size: u32) -> Result<()> {
+        let chain = self.read_chain(parent_cluster)?;
+        let cluster_size = self.superblock.cluster_size() as usize;
+        let entries_per_cluster = cluster_size / DIRENT_SIZE;
+
+        for &cluster in &chain {
+            let base_offset = self.cluster_offset(cluster)?;
+            for slot in 0..entries_per_cluster {
+                let slot_offset = base_offset + (slot * DIRENT_SIZE) as u64;
+                let entry = self.read_dirent_at(slot_offset)?;
+
+                if entry.is_end() {
+                    return Err(FatxError::FileNotFound(name.to_string()));
+                }
+                if !entry.is_deleted() && entry.filename().eq_ignore_ascii_case(name) {
+                    // File size is at offset 48 within the 64-byte directory entry
+                    let size_bytes = self.write_u32_bytes(new_size);
+                    self.write_at(slot_offset + 48, &size_bytes)?;
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(FatxError::FileNotFound(name.to_string()))
+    }
+
     /// Delete a file or empty directory at the specified path.
     pub fn delete(&mut self, path: &str) -> Result<()> {
         let (parent_path, target_name) = split_path(path);

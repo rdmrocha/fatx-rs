@@ -657,3 +657,265 @@ fn test_flush_persists_fat() {
     let data = vol.read_file_by_path("/persist.txt").expect("read");
     assert_eq!(data, b"persistent data");
 }
+
+// ===========================================================================
+// Deep recursive directory deletion (1–10 layers)
+// ===========================================================================
+
+/// Regression test for Finder directory deletion.
+/// Finder sends a single NFS remove for a non-empty directory. The NFS layer
+/// falls back to delete_recursive, which must handle arbitrarily deep trees.
+/// This test builds nested directories from 1 to 10 levels deep, each with a
+/// file at every level, then verifies delete_recursive removes everything and
+/// frees all clusters.
+#[test]
+fn test_delete_recursive_deep_1_to_10_layers() {
+    // Use a larger image — deep trees with files at every level need space
+    let cursor = create_test_image(8);
+    let mut vol = FatxVolume::open(cursor, 0, 0).expect("open");
+
+    for depth in 1..=10 {
+        // Build the nested path: /d1/d2/d3/.../dN
+        let mut dir_path = String::new();
+        for level in 1..=depth {
+            dir_path.push_str(&format!("/d{}", level));
+            vol.create_directory(&dir_path)
+                .unwrap_or_else(|_| panic!("mkdir {} (depth={})", dir_path, depth));
+
+            // Put a file at every level so delete_recursive must handle mixed content
+            let file_path = format!("{}/f{}.bin", dir_path, level);
+            let data = vec![level as u8; 256]; // small file with recognizable content
+            vol.create_file(&file_path, &data)
+                .unwrap_or_else(|_| panic!("create {} (depth={})", file_path, depth));
+        }
+
+        // Snapshot free clusters before delete
+        let stats_before = vol.stats().expect("stats before delete");
+
+        // delete_recursive on the root of the tree
+        vol.delete_recursive("/d1")
+            .unwrap_or_else(|_| panic!("delete_recursive depth={}", depth));
+
+        // Root directory should be empty
+        let root = vol.read_root_directory().expect("read root");
+        assert!(
+            root.is_empty(),
+            "root not empty after delete_recursive depth={}",
+            depth
+        );
+
+        // All clusters should be freed
+        let stats_after = vol.stats().expect("stats after delete");
+        assert!(
+            stats_after.free_clusters > stats_before.free_clusters,
+            "clusters not freed after delete_recursive depth={}: before={}, after={}",
+            depth,
+            stats_before.free_clusters,
+            stats_after.free_clusters
+        );
+
+        // Verify the deepest path is truly gone
+        assert!(
+            vol.resolve_path("/d1").is_err(),
+            "/d1 still exists after delete_recursive depth={}",
+            depth
+        );
+    }
+}
+
+/// Verify that delete_recursive on a tree with wide + deep branches works.
+/// Simulates an Xbox game content directory: a parent with multiple subdirs,
+/// each containing files.
+#[test]
+fn test_delete_recursive_wide_and_deep() {
+    let cursor = create_test_image(8);
+    let mut vol = FatxVolume::open(cursor, 0, 0).expect("open");
+
+    // Create structure:
+    //   /game/
+    //     save1/ -> data.bin
+    //     save2/ -> data.bin, meta.txt
+    //     save3/
+    //       sub/ -> deep.bin
+    vol.create_directory("/game").expect("mkdir game");
+
+    vol.create_directory("/game/save1").expect("mkdir save1");
+    vol.create_file("/game/save1/data.bin", &[0xAA; 1024])
+        .expect("create save1/data.bin");
+
+    vol.create_directory("/game/save2").expect("mkdir save2");
+    vol.create_file("/game/save2/data.bin", &[0xBB; 2048])
+        .expect("create save2/data.bin");
+    vol.create_file("/game/save2/meta.txt", b"save metadata")
+        .expect("create save2/meta.txt");
+
+    vol.create_directory("/game/save3").expect("mkdir save3");
+    vol.create_directory("/game/save3/sub")
+        .expect("mkdir save3/sub");
+    vol.create_file("/game/save3/sub/deep.bin", &[0xCC; 512])
+        .expect("create save3/sub/deep.bin");
+
+    let stats_before = vol.stats().expect("stats");
+
+    vol.delete_recursive("/game")
+        .expect("delete_recursive /game");
+
+    // Everything should be gone
+    assert!(vol.resolve_path("/game").is_err());
+    assert!(vol.read_root_directory().unwrap().is_empty());
+
+    // Clusters freed
+    let stats_after = vol.stats().expect("stats");
+    assert!(stats_after.free_clusters > stats_before.free_clusters);
+}
+
+// ===========================================================================
+// In-place file writes (write_file_in_place)
+// ===========================================================================
+
+/// Basic in-place write: overwrite a file with same-size data.
+/// No cluster allocation or freeing needed — pure data overwrite.
+#[test]
+fn test_write_in_place_same_size() {
+    let cursor = create_test_image(4);
+    let mut vol = FatxVolume::open(cursor, 0, 0).expect("open");
+
+    vol.create_file("/test.bin", &[0xAA; 1024]).expect("create");
+    let stats_before = vol.stats().expect("stats");
+
+    vol.write_file_in_place("/test.bin", &[0xBB; 1024])
+        .expect("write in-place");
+
+    let data = vol.read_file_by_path("/test.bin").expect("read");
+    assert_eq!(data, vec![0xBB; 1024]);
+
+    // No cluster changes — free count should be the same
+    let stats_after = vol.stats().expect("stats");
+    assert_eq!(stats_after.free_clusters, stats_before.free_clusters);
+}
+
+/// In-place write where file grows — must extend the cluster chain.
+#[test]
+fn test_write_in_place_file_grows() {
+    let cursor = create_test_image(4);
+    let mut vol = FatxVolume::open(cursor, 0, 0).expect("open");
+
+    // Create a small file (1 cluster)
+    vol.create_file("/grow.bin", &[0x11; 100]).expect("create");
+    let stats_small = vol.stats().expect("stats");
+
+    // Write much larger data (multiple clusters)
+    let big_data = vec![0x22; 50000];
+    vol.write_file_in_place("/grow.bin", &big_data)
+        .expect("write in-place grow");
+
+    let read_back = vol.read_file_by_path("/grow.bin").expect("read");
+    assert_eq!(read_back, big_data);
+
+    // Should have used more clusters
+    let stats_big = vol.stats().expect("stats");
+    assert!(stats_big.free_clusters < stats_small.free_clusters);
+}
+
+/// In-place write where file shrinks — must free excess clusters.
+#[test]
+fn test_write_in_place_file_shrinks() {
+    let cursor = create_test_image(4);
+    let mut vol = FatxVolume::open(cursor, 0, 0).expect("open");
+
+    // Create a large file (multiple clusters)
+    let big_data = vec![0x33; 50000];
+    vol.create_file("/shrink.bin", &big_data).expect("create");
+    let stats_big = vol.stats().expect("stats");
+
+    // Overwrite with small data
+    vol.write_file_in_place("/shrink.bin", &[0x44; 100])
+        .expect("write in-place shrink");
+
+    let read_back = vol.read_file_by_path("/shrink.bin").expect("read");
+    assert_eq!(read_back, vec![0x44; 100]);
+
+    // Should have freed clusters
+    let stats_small = vol.stats().expect("stats");
+    assert!(stats_small.free_clusters > stats_big.free_clusters);
+}
+
+/// In-place write updates the directory entry file_size correctly.
+#[test]
+fn test_write_in_place_updates_dirent_size() {
+    let cursor = create_test_image(4);
+    let mut vol = FatxVolume::open(cursor, 0, 0).expect("open");
+
+    vol.create_file("/size.bin", &[0x55; 1000]).expect("create");
+
+    // Verify initial size
+    let entry = vol.resolve_path("/size.bin").expect("resolve");
+    assert_eq!(entry.file_size, 1000);
+
+    // Write larger data
+    vol.write_file_in_place("/size.bin", &[0x66; 5000])
+        .expect("write in-place");
+
+    let entry = vol.resolve_path("/size.bin").expect("resolve after");
+    assert_eq!(entry.file_size, 5000);
+
+    // Write smaller data
+    vol.write_file_in_place("/size.bin", &[0x77; 200])
+        .expect("write in-place shrink");
+
+    let entry = vol.resolve_path("/size.bin").expect("resolve after shrink");
+    assert_eq!(entry.file_size, 200);
+}
+
+/// Multiple in-place writes simulate the NFS flush cycle:
+/// write, flush, write more, flush again.
+#[test]
+fn test_write_in_place_repeated_overwrites() {
+    let cursor = create_test_image(4);
+    let mut vol = FatxVolume::open(cursor, 0, 0).expect("open");
+
+    vol.create_file("/cycle.bin", &[0x00; 100]).expect("create");
+
+    // Simulate 10 flush cycles with growing data (like NFS buffered writes)
+    for i in 1..=10u8 {
+        let size = (i as usize) * 1000;
+        let data = vec![i; size];
+        vol.write_file_in_place("/cycle.bin", &data)
+            .expect(&format!("write cycle {}", i));
+
+        let read_back = vol.read_file_by_path("/cycle.bin").expect("read");
+        assert_eq!(read_back.len(), size);
+        assert_eq!(read_back[0], i);
+        assert_eq!(read_back[size - 1], i);
+    }
+}
+
+/// In-place write on a file in a subdirectory.
+#[test]
+fn test_write_in_place_subdirectory() {
+    let cursor = create_test_image(4);
+    let mut vol = FatxVolume::open(cursor, 0, 0).expect("open");
+
+    vol.create_directory("/Content").expect("mkdir");
+    vol.create_directory("/Content/Game").expect("mkdir game");
+    vol.create_file("/Content/Game/save.dat", &[0xAA; 2048])
+        .expect("create");
+
+    vol.write_file_in_place("/Content/Game/save.dat", &[0xBB; 4096])
+        .expect("write in-place subdir");
+
+    let data = vol
+        .read_file_by_path("/Content/Game/save.dat")
+        .expect("read");
+    assert_eq!(data, vec![0xBB; 4096]);
+}
+
+/// In-place write on nonexistent file should return FileNotFound.
+#[test]
+fn test_write_in_place_nonexistent_fails() {
+    let cursor = create_test_image(2);
+    let mut vol = FatxVolume::open(cursor, 0, 0).expect("open");
+
+    let result = vol.write_file_in_place("/nope.bin", &[0xFF; 100]);
+    assert!(result.is_err());
+}

@@ -392,7 +392,10 @@ fn interactive_mode() {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error opening '{}': {}", device_path.display(), e);
-            if e.kind() == io::ErrorKind::PermissionDenied {
+            if e.kind() == io::ErrorKind::NotFound {
+                eprintln!("Device not found. Run 'diskutil list' to find your Xbox drive.");
+                eprintln!("Look for an unrecognized disk and use /dev/rdiskN (raw device).");
+            } else if e.kind() == io::ErrorKind::PermissionDenied {
                 eprintln!("Hint: Run with sudo for raw device access.");
             }
             return;
@@ -1234,6 +1237,46 @@ fn open_volume(
 
     FatxVolume::open(file, offset, size).unwrap_or_else(|e| {
         eprintln!("Error opening FATX volume: {}", e);
+
+        // If no partition was specified, scan and show available partitions
+        if partition.is_none() && offset == 0 {
+            eprintln!();
+            eprintln!("No --partition specified. This device likely has multiple Xbox partitions.");
+            eprintln!(
+                "Run: fatx scan {} to see available partitions.",
+                device.display()
+            );
+
+            // Try to auto-detect and list partitions
+            if let Ok(mut f) = std::fs::File::open(device) {
+                let dev_size = get_device_size(&mut f);
+                if let Ok(parts) = fatxlib::partition::detect_xbox_partitions(&mut f, dev_size) {
+                    if !parts.is_empty() {
+                        eprintln!();
+                        eprintln!("Available partitions:");
+                        for p in &parts {
+                            if p.has_valid_magic {
+                                eprintln!(
+                                    "  --partition \"{}\"  ({})",
+                                    p.name,
+                                    fatxlib::partition::format_size(p.size)
+                                );
+                            }
+                        }
+                        eprintln!();
+                        eprintln!(
+                            "Example: sudo fatx browse {} --partition \"{}\"",
+                            device.display(),
+                            parts
+                                .iter()
+                                .find(|p| p.has_valid_magic)
+                                .map(|p| p.name.as_str())
+                                .unwrap_or("360 Data")
+                        );
+                    }
+                }
+            }
+        }
         process::exit(1);
     })
 }

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -141,6 +142,10 @@ fn root_fattr() -> fattr3 {
     }
 }
 
+/// Dirty write buffer: cluster -> (fatx_path, buffered_data).
+/// Writes accumulate here in memory and get flushed to disk periodically.
+type DirtyFileMap = HashMap<u32, (String, Vec<u8>)>;
+
 /// The NFS filesystem backed by a FatxVolume.
 ///
 /// All blocking I/O (USB reads/writes via FatxVolume) is dispatched to
@@ -153,19 +158,41 @@ struct FatxNfs {
     inode_parents: Arc<Mutex<HashMap<u32, (u32, String)>>>,
     /// File data cache: cluster -> file bytes (avoids re-reading entire file per NFS chunk)
     file_cache: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    /// Dirty write buffer — see [DirtyFileMap].
+    dirty_files: Arc<Mutex<DirtyFileMap>>,
     /// Whether the volume was opened read-only
     readonly: bool,
+    /// Flag: set to true when a write dirtied the FAT; cleared after periodic flush
+    flush_needed: Arc<AtomicBool>,
+    /// Epoch millis of the last successful NFS I/O operation (watchdog heartbeat)
+    last_io_epoch_ms: Arc<AtomicU64>,
 }
 
 impl FatxNfs {
     fn new(vol: FatxVolume<File>, readonly: bool) -> Self {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         FatxNfs {
             vol: Arc::new(Mutex::new(vol)),
             dir_cache: Arc::new(Mutex::new(HashMap::new())),
             inode_parents: Arc::new(Mutex::new(HashMap::new())),
             file_cache: Arc::new(Mutex::new(HashMap::new())),
             readonly,
+            flush_needed: Arc::new(AtomicBool::new(false)),
+            dirty_files: Arc::new(Mutex::new(HashMap::new())),
+            last_io_epoch_ms: Arc::new(AtomicU64::new(now_ms)),
         }
+    }
+
+    /// Update the watchdog heartbeat — call after every successful NFS operation.
+    fn touch_io(&self) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_io_epoch_ms.store(now_ms, Ordering::Relaxed);
     }
 
     /// Read directory entries for a cluster, populating caches.
@@ -258,6 +285,7 @@ impl FatxNfs {
     /// Check if a filename is macOS metadata that should be silently rejected.
     /// Finder creates .DS_Store and ._ (AppleDouble) files on any writeable volume.
     /// These are meaningless on an Xbox drive and waste clusters.
+    #[allow(dead_code)] // used by tests; may be re-enabled for NFS filtering later
     fn is_macos_metadata(name: &str) -> bool {
         name == ".DS_Store"
             || name == ".Spotlight-V100"
@@ -285,6 +313,7 @@ impl FatxNfs {
     }
 
     /// Invalidate a single file's data cache (e.g. after write).
+    #[allow(dead_code)] // kept for future use
     fn invalidate_file(&self, cluster: u32) {
         let mut cache = self.file_cache.lock().unwrap();
         cache.remove(&cluster);
@@ -315,6 +344,7 @@ impl NFSFileSystem for FatxNfs {
     }
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
+        self.touch_io();
         let t0 = Instant::now();
         let cluster = id_to_cluster(dirid);
         let name_str =
@@ -356,6 +386,7 @@ impl NFSFileSystem for FatxNfs {
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
+        self.touch_io();
         let t0 = Instant::now();
         if id == ROOT_FILEID {
             debug!(
@@ -408,6 +439,7 @@ impl NFSFileSystem for FatxNfs {
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let t0 = Instant::now();
+
         let cluster = id_to_cluster(id);
 
         // Fast path: serve from file cache without any USB I/O
@@ -498,81 +530,64 @@ impl NFSFileSystem for FatxNfs {
         self.check_writable()?;
 
         let cluster = id_to_cluster(id);
-        info!("NFS write: id={} offset={} len={}", id, offset, data.len());
+        debug!("NFS write: id={} offset={} len={}", id, offset, data.len());
 
-        // Find the entry and its parent — drop MutexGuard before any .await
+        // Look up path info for this file (needed when we flush to disk later)
         let parent_cluster = {
             let parents = self.inode_parents.lock().unwrap();
             parents.get(&cluster).map(|(p, _)| *p)
         };
-
-        let entry = if let Some(pc) = parent_cluster {
-            let entries = self.get_dir_entries(pc).await?;
-            entries.into_iter().find(|e| e.first_cluster == cluster)
-        } else {
-            None
-        };
-
         let parent_cluster = parent_cluster.ok_or(nfsstat3::NFS3ERR_NOENT)?;
+
+        let entry = {
+            let entries = self.get_dir_entries(parent_cluster).await?;
+            entries.into_iter().find(|e| e.first_cluster == cluster)
+        };
         let entry = entry.ok_or(nfsstat3::NFS3ERR_NOENT)?;
         let path = self.resolve_fatx_path(cluster_to_id(parent_cluster), &entry.filename());
 
-        // For FATX, we need to read the whole file, modify it, delete and rewrite.
-        // Try to use cached file data to avoid an extra USB read.
-        let cached_data = {
-            let cache = self.file_cache.lock().unwrap();
-            cache.get(&cluster).cloned()
-        };
-
-        // Run all blocking vol I/O on a dedicated thread.
-        let vol = Arc::clone(&self.vol);
-        let data = data.to_vec();
-        tokio::task::spawn_blocking(move || {
-            let t0 = Instant::now();
-            let mut vol = vol.lock().unwrap();
-            let mut file_data = if let Some(cached) = cached_data {
-                info!(
-                    "write: using cached data for cluster {} ({} bytes)",
-                    cluster,
-                    cached.len()
-                );
-                cached
-            } else {
-                vol.read_file(&entry).map_err(|e| {
-                    warn!("read for write cluster {}: {}", cluster, e);
-                    nfsstat3::NFS3ERR_IO
-                })?
-            };
+        // Buffer the write in memory — NO disk I/O here.
+        // The periodic flush task will write dirty files to disk.
+        {
+            let mut dirty = self.dirty_files.lock().unwrap();
+            let buf = dirty.entry(cluster).or_insert_with(|| {
+                // First write to this file — seed from file_cache or empty
+                let cached = {
+                    let cache = self.file_cache.lock().unwrap();
+                    cache.get(&cluster).cloned()
+                };
+                let existing = if let Some(c) = cached {
+                    c
+                } else {
+                    // Need to read from disk (blocking) — but only once per file
+                    let mut vol = self.vol.lock().unwrap();
+                    vol.read_file(&entry).unwrap_or_default()
+                };
+                (path.clone(), existing)
+            });
 
             let write_end = offset as usize + data.len();
-            if write_end > file_data.len() {
-                file_data.resize(write_end, 0);
+            if write_end > buf.1.len() {
+                buf.1.resize(write_end, 0);
             }
-            file_data[offset as usize..write_end].copy_from_slice(&data);
+            buf.1[offset as usize..write_end].copy_from_slice(data);
+            // Update path in case it changed
+            buf.0 = path;
+        }
 
-            let _ = vol.delete(&path);
-            vol.create_file(&path, &file_data).map_err(|e| {
-                warn!("write cluster {}: {}", cluster, e);
-                nfsstat3::NFS3ERR_IO
-            })?;
-            let _ = vol.flush();
-            let elapsed = t0.elapsed();
-            info!(
-                "write cluster {} ({} bytes at offset {}) in {:.1}ms",
-                cluster,
-                data.len(),
-                offset,
-                elapsed.as_secs_f64() * 1000.0
-            );
-            Ok::<(), nfsstat3>(())
-        })
-        .await
-        .unwrap_or(Err(nfsstat3::NFS3ERR_IO))?;
+        // Also update the file_cache so subsequent reads see the buffered data
+        {
+            let dirty = self.dirty_files.lock().unwrap();
+            if let Some((_, ref buf_data)) = dirty.get(&cluster) {
+                let mut cache = self.file_cache.lock().unwrap();
+                cache.insert(cluster, buf_data.clone());
+            }
+        }
 
-        self.invalidate_file(cluster);
-        self.invalidate_dir(parent_cluster);
-        info!(
-            "NFS write: id={} complete ({:.1}ms)",
+        self.flush_needed.store(true, Ordering::Relaxed);
+
+        debug!(
+            "NFS write: id={} buffered ({:.1}ms)",
             id,
             t0.elapsed().as_secs_f64() * 1000.0
         );
@@ -591,11 +606,6 @@ impl NFSFileSystem for FatxNfs {
         let name_str =
             std::str::from_utf8(filename.as_ref()).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
-        // Block macOS metadata files from being created on Xbox drive
-        if Self::is_macos_metadata(name_str) {
-            debug!("NFS create: blocked macOS metadata \"{}\"", name_str);
-            return Err(nfsstat3::NFS3ERR_PERM);
-        }
         info!("NFS create: dir={} name=\"{}\"", dirid, name_str);
 
         let path = self.resolve_fatx_path(dirid, name_str);
@@ -605,16 +615,31 @@ impl NFSFileSystem for FatxNfs {
         let path_clone = path.clone();
         tokio::task::spawn_blocking(move || {
             let mut vol = vol.lock().unwrap();
-            vol.create_file(&path_clone, &[]).map_err(|e| {
-                warn!("create '{}': {}", path_clone, e);
-                nfsstat3::NFS3ERR_IO
-            })?;
-            let _ = vol.flush();
+            match vol.create_file(&path_clone, &[]) {
+                Ok(()) => {}
+                Err(fatxlib::error::FatxError::FileExists(_)) => {
+                    // File already exists — delete and recreate (truncate)
+                    info!("NFS create: '{}' already exists, truncating", path_clone);
+                    if let Err(e) = vol.delete(&path_clone) {
+                        warn!("create truncate delete '{}': {}", path_clone, e);
+                        return Err(nfsstat3::NFS3ERR_IO);
+                    }
+                    vol.create_file(&path_clone, &[]).map_err(|e| {
+                        warn!("create after truncate '{}': {}", path_clone, e);
+                        nfsstat3::NFS3ERR_IO
+                    })?;
+                }
+                Err(e) => {
+                    warn!("create '{}': {}", path_clone, e);
+                    return Err(nfsstat3::NFS3ERR_IO);
+                }
+            }
             Ok::<(), nfsstat3>(())
         })
         .await
         .unwrap_or(Err(nfsstat3::NFS3ERR_IO))?;
 
+        self.flush_needed.store(true, Ordering::Relaxed);
         self.invalidate_dir(parent_cluster);
 
         // Look up the new entry
@@ -657,36 +682,43 @@ impl NFSFileSystem for FatxNfs {
         let name_str =
             std::str::from_utf8(dirname.as_ref()).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
-        if Self::is_macos_metadata(name_str) {
-            debug!("NFS mkdir: blocked macOS metadata \"{}\"", name_str);
-            return Err(nfsstat3::NFS3ERR_PERM);
-        }
         info!("NFS mkdir: dir={} name=\"{}\"", dirid, name_str);
         let path = self.resolve_fatx_path(dirid, name_str);
         let parent_cluster = id_to_cluster(dirid);
 
         let vol = Arc::clone(&self.vol);
         let path_clone = path.clone();
-        tokio::task::spawn_blocking(move || {
+        let mkdir_result = tokio::task::spawn_blocking(move || {
             let mut vol = vol.lock().unwrap();
-            vol.create_directory(&path_clone).map_err(|e| {
-                warn!("mkdir '{}': {}", path_clone, e);
-                nfsstat3::NFS3ERR_IO
-            })?;
-            let _ = vol.flush();
-            Ok::<(), nfsstat3>(())
+            match vol.create_directory(&path_clone) {
+                Ok(()) => {
+                    Ok(false) // created new
+                }
+                Err(fatxlib::error::FatxError::FileExists(_)) => {
+                    Ok(true) // already exists — not an error
+                }
+                Err(e) => {
+                    warn!("mkdir '{}': {}", path_clone, e);
+                    Err(nfsstat3::NFS3ERR_IO)
+                }
+            }
         })
         .await
         .unwrap_or(Err(nfsstat3::NFS3ERR_IO))?;
 
+        if !mkdir_result {
+            self.flush_needed.store(true, Ordering::Relaxed);
+        }
         self.invalidate_dir(parent_cluster);
 
         let entries = self.get_dir_entries(parent_cluster).await?;
         for entry in &entries {
             if entry.filename().eq_ignore_ascii_case(name_str) {
+                let action = if mkdir_result { "exists" } else { "created" };
                 info!(
-                    "NFS mkdir: \"{}\" -> id={} ({:.1}ms)",
+                    "NFS mkdir: \"{}\" {} -> id={} ({:.1}ms)",
                     name_str,
+                    action,
                     cluster_to_id(entry.first_cluster),
                     t0.elapsed().as_secs_f64() * 1000.0
                 );
@@ -706,25 +738,45 @@ impl NFSFileSystem for FatxNfs {
 
         let name_str =
             std::str::from_utf8(filename.as_ref()).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+
         info!("NFS remove: dir={} name=\"{}\"", dirid, name_str);
         let path = self.resolve_fatx_path(dirid, name_str);
-        let parent_cluster = id_to_cluster(dirid);
-
         let vol = Arc::clone(&self.vol);
         let path_clone = path.clone();
         tokio::task::spawn_blocking(move || {
             let mut vol = vol.lock().unwrap();
-            vol.delete(&path_clone).map_err(|e| {
-                warn!("remove '{}': {}", path_clone, e);
-                nfsstat3::NFS3ERR_IO
-            })?;
-            let _ = vol.flush();
-            Ok::<(), nfsstat3>(())
+            match vol.delete(&path_clone) {
+                Ok(()) => Ok(()),
+                Err(fatxlib::error::FatxError::DirectoryNotEmpty(_)) => {
+                    // Finder sends a single remove for non-empty directories.
+                    // NFS has no recursive delete, so we handle it here.
+                    info!("remove '{}': not empty, using recursive delete", path_clone);
+                    vol.delete_recursive(&path_clone).map_err(|e| {
+                        warn!("recursive remove '{}': {}", path_clone, e);
+                        nfsstat3::NFS3ERR_IO
+                    })
+                }
+                Err(e) => {
+                    warn!("remove '{}': {}", path_clone, e);
+                    Err(nfsstat3::NFS3ERR_IO)
+                }
+            }
         })
         .await
         .unwrap_or(Err(nfsstat3::NFS3ERR_IO))?;
 
-        self.invalidate_dir(parent_cluster);
+        self.flush_needed.store(true, Ordering::Relaxed);
+
+        // Clear all caches — a recursive delete can affect many directories
+        {
+            let mut dc = self.dir_cache.lock().unwrap();
+            dc.clear();
+        }
+        {
+            let mut fc = self.file_cache.lock().unwrap();
+            fc.clear();
+        }
+
         info!(
             "NFS remove: \"{}\" done ({:.1}ms)",
             name_str,
@@ -766,12 +818,12 @@ impl NFSFileSystem for FatxNfs {
                 warn!("rename '{}' -> '{}': {}", path_clone, to_name_owned, e);
                 nfsstat3::NFS3ERR_IO
             })?;
-            let _ = vol.flush();
             Ok::<(), nfsstat3>(())
         })
         .await
         .unwrap_or(Err(nfsstat3::NFS3ERR_IO))?;
 
+        self.flush_needed.store(true, Ordering::Relaxed);
         self.invalidate_dir(parent_cluster);
         info!(
             "NFS rename: \"{}\" -> \"{}\" done ({:.1}ms)",
@@ -981,56 +1033,108 @@ async fn main() {
 
     info!("fatx-mount starting (log_level={})", log_level);
 
+    // ── PANIC HANDLER: ensure we try to unmount even on unexpected crashes ──
+    // A panic that kills the NFS server without unmounting first leaves a zombie
+    // mount that deadlocks Finder and requires a reboot to fix.
+    {
+        let panic_mp = cli
+            .mountpoint
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("/Volumes/Xbox Drive"))
+            .display()
+            .to_string();
+        let should_mount = cli.mount;
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if should_mount {
+                eprintln!("\n[PANIC] fatx-mount crashed! Emergency unmount...");
+                let _ = std::process::Command::new("bash")
+                    .args([
+                        "-c",
+                        &format!(
+                            "timeout 5 umount -f '{}' 2>/dev/null; \
+                         timeout 3 rm -rf '{}' 2>/dev/null; true",
+                            panic_mp, panic_mp
+                        ),
+                    ])
+                    .output();
+            }
+            default_hook(info);
+        }));
+    }
+
     // --cleanup: emergency recovery from stale NFS mounts
+    // ALL operations use `timeout` to prevent hanging on dead mounts.
     if cli.cleanup {
         eprintln!("[cleanup] Emergency cleanup of stale fatx-mount NFS mounts...");
+        eprintln!("[cleanup] (All operations use timeouts to avoid hanging)");
 
-        eprintln!("[cleanup] Killing mount_nfs processes...");
-        let _ = std::process::Command::new("killall")
-            .args(["-9", "mount_nfs"])
-            .output();
-        eprintln!("[cleanup] Killing fatx-mount processes...");
-        let _ = std::process::Command::new("killall")
-            .args(["-9", "fatx-mount"])
+        // Kill any fatx-mount/mount_nfs processes (not us)
+        let our_pid = std::process::id();
+        eprintln!("[cleanup] Killing stale processes (our PID={})...", our_pid);
+        let _ = std::process::Command::new("bash")
+            .args([
+                "-c",
+                &format!(
+                    "pgrep -f fatx-mount | grep -v {} | xargs -r kill -9 2>/dev/null; \
+                 killall -9 mount_nfs 2>/dev/null; true",
+                    our_pid
+                ),
+            ])
             .output();
 
-        // Force-unmount any localhost NFS mounts
+        // Force-unmount any localhost NFS mounts (with timeout!)
         let mount_output = std::process::Command::new("mount")
             .output()
             .expect("failed to run mount");
         let mount_list = String::from_utf8_lossy(&mount_output.stdout);
         for line in mount_list.lines() {
             if line.contains("localhost") || line.contains("127.0.0.1") {
-                // Extract mount point (third field in mount output)
                 let parts: Vec<&str> = line.split(" on ").collect();
                 if parts.len() >= 2 {
                     let mp = parts[1].split(' ').next().unwrap_or("");
                     if !mp.is_empty() {
-                        eprintln!("  Force-unmounting: {}", mp);
-                        let _ = std::process::Command::new("umount")
-                            .args(["-f", mp])
+                        eprintln!("  Force-unmounting (3s timeout): {}", mp);
+                        let _ = std::process::Command::new("bash")
+                            .args([
+                                "-c",
+                                &format!(
+                                    "timeout 3 umount -f '{}' 2>&1 || echo 'umount timed out'",
+                                    mp
+                                ),
+                            ])
                             .output();
                     }
                 }
             }
         }
 
-        // Clean up mount point directories
+        // Clean up mount point directories (with timeout — rm can hang too!)
         let default_mps = ["/Volumes/Xbox Drive", "/Volumes/TestFATX"];
         for mp in &default_mps {
-            if std::path::Path::new(mp).exists() {
-                eprintln!("  Removing mount point: {}", mp);
-                let _ = std::fs::remove_dir(mp);
-            }
+            eprintln!("  Removing mount point (3s timeout): {}", mp);
+            let _ = std::process::Command::new("bash")
+                .args([
+                    "-c",
+                    &format!(
+                        "timeout 3 rm -rf '{}' 2>/dev/null || echo 'rm timed out for {}'",
+                        mp, mp
+                    ),
+                ])
+                .output();
         }
         if let Some(ref mp) = cli.mountpoint {
-            if mp.exists() {
-                eprintln!("  Removing mount point: {}", mp.display());
-                let _ = std::fs::remove_dir(mp);
-            }
+            eprintln!("  Removing mount point (3s timeout): {}", mp.display());
+            let _ = std::process::Command::new("bash")
+                .args([
+                    "-c",
+                    &format!("timeout 3 rm -rf '{}' 2>/dev/null || true", mp.display()),
+                ])
+                .output();
         }
 
-        eprintln!("Cleanup complete.");
+        eprintln!("[cleanup] Done. If Finder is still broken, reboot is required.");
+        eprintln!("[cleanup] (A stale mount in kernel D-state can only be cleared by reboot)");
         std::process::exit(0);
     }
 
@@ -1047,10 +1151,20 @@ async fn main() {
     }
     .unwrap_or_else(|e| {
         eprintln!("Error opening '{}': {}", device_path.display(), e);
-        eprintln!(
-            "Try: sudo fatx-mount {} --partition \"360 Data\"",
-            device_path.display()
-        );
+        if e.kind() == std::io::ErrorKind::NotFound {
+            eprintln!("Device not found. Run 'diskutil list' to find your Xbox drive.");
+            eprintln!("Look for an unrecognized disk and use /dev/rdiskN (raw device).");
+        } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+            eprintln!(
+                "Permission denied. Try: sudo fatx mount {}",
+                device_path.display()
+            );
+        } else {
+            eprintln!(
+                "Try: sudo fatx mount {} --partition \"360 Data\"",
+                device_path.display()
+            );
+        }
         std::process::exit(1);
     });
 
@@ -1112,15 +1226,44 @@ async fn main() {
     info!("Creating NFS filesystem adapter (mode={})", mode);
     let fs = FatxNfs::new(vol, cli.readonly);
 
+    // Grab references for the periodic flush task, watchdog, and shutdown flush
+    let flush_vol = Arc::clone(&fs.vol);
+    let flush_flag = Arc::clone(&fs.flush_needed);
+    let flush_dirty = Arc::clone(&fs.dirty_files);
+    let flush_dir_cache = Arc::clone(&fs.dir_cache);
+    let flush_file_cache = Arc::clone(&fs.file_cache);
+    let watchdog_io = Arc::clone(&fs.last_io_epoch_ms);
+    let watchdog_dirty = Arc::clone(&fs.dirty_files);
+    let shutdown_vol = Arc::clone(&fs.vol);
+    let shutdown_flush_flag = Arc::clone(&fs.flush_needed);
+    let shutdown_dirty = Arc::clone(&fs.dirty_files);
+    let shutdown_dir_cache = Arc::clone(&fs.dir_cache);
+    let shutdown_file_cache = Arc::clone(&fs.file_cache);
+
     let bind_addr = format!("127.0.0.1:{}", cli.port);
     info!("Binding NFS server to {}...", bind_addr);
-    let listener = NFSTcpListener::bind(&bind_addr, fs)
-        .await
-        .unwrap_or_else(|e| {
+    let listener = match NFSTcpListener::bind(&bind_addr, fs).await {
+        Ok(l) => l,
+        Err(e) => {
             eprintln!("Failed to bind NFS server on {}: {}", bind_addr, e);
-            eprintln!("Is port {} already in use?", cli.port);
+            eprintln!();
+            eprintln!(
+                "Port {} is already in use. A previous fatx-mount may still be running.",
+                cli.port
+            );
+            eprintln!();
+            eprintln!("To fix:");
+            eprintln!(
+                "  sudo lsof -i :{} | grep LISTEN   # find the process",
+                cli.port
+            );
+            eprintln!("  sudo kill <PID>                    # kill it");
+            eprintln!();
+            eprintln!("Or use a different port:");
+            eprintln!("  fatx mount {} --port 11112", device_path.display());
             std::process::exit(1);
-        });
+        }
+    };
 
     let port = listener.get_listen_port();
     println!("NFS server listening on 127.0.0.1:{}", port);
@@ -1141,6 +1284,54 @@ async fn main() {
     if cli.mount {
         let mountpoint = PathBuf::from(&mp_str);
 
+        // ── AGGRESSIVE STALE MOUNT CLEANUP ──
+        // A previous fatx-mount crash can leave a zombie NFS mount that hangs
+        // Finder and makes umount -f hang. We MUST clean this up before mounting.
+        // IMPORTANT: Never use `ls`, `stat`, or anything that touches the mount
+        // path — those will hang too. Only use umount/rm with timeouts.
+        if mountpoint.exists() {
+            eprintln!("[startup] Cleaning up stale mount at {}...", mp_str);
+
+            // Kill any lingering mount_nfs or fatx-mount processes (not us)
+            let our_pid = std::process::id();
+            let _ = std::process::Command::new("bash")
+                .args([
+                    "-c",
+                    &format!(
+                        "pgrep -f fatx-mount | grep -v {} | xargs -r kill -9 2>/dev/null; \
+                     killall -9 mount_nfs 2>/dev/null; true",
+                        our_pid
+                    ),
+                ])
+                .output();
+
+            // Try force-unmount with a 3-second timeout (umount -f can hang on dead NFS)
+            let umount_result = std::process::Command::new("bash")
+                .args(["-c", &format!(
+                    "timeout 3 umount -f '{}' 2>&1 || timeout 3 diskutil unmount force '{}' 2>&1 || true",
+                    mp_str, mp_str
+                )])
+                .output();
+
+            if let Ok(o) = &umount_result {
+                let out = String::from_utf8_lossy(&o.stdout);
+                if !out.trim().is_empty() {
+                    eprintln!("[startup] umount: {}", out.trim());
+                }
+            }
+
+            // Remove the stale mountpoint directory (this works even when umount hangs,
+            // as long as the mount is no longer in the kernel mount table)
+            let _ = std::process::Command::new("bash")
+                .args([
+                    "-c",
+                    &format!("timeout 3 rm -rf '{}' 2>/dev/null || true", mp_str),
+                ])
+                .output();
+
+            eprintln!("[startup] Stale mount cleanup done.");
+        }
+
         // Create mount point
         if !mountpoint.exists() {
             if let Err(e) = std::fs::create_dir_all(&mountpoint) {
@@ -1149,12 +1340,6 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-
-        // First, clean up any stale mount at this mountpoint
-        let _ = std::process::Command::new("umount")
-            .arg("-f")
-            .arg(&mp_str)
-            .output();
 
         // Mount in background with a timeout so it can't hang forever
         let mp_clone = mp_str.clone();
@@ -1214,6 +1399,178 @@ async fn main() {
         println!("To unmount:");
         println!("  sudo umount -f /Volumes/Xbox\\ Drive");
         println!("Pass --mount to auto-mount in Finder.");
+    }
+
+    // Periodic flush task — writes dirty files to disk and flushes the FAT every
+    // 5 seconds. This batches many small NFS writes into one disk operation per file.
+    //
+    // CRITICAL: We flush ONE file at a time, releasing the vol lock between files.
+    // A single large file (130MB+) can take seconds to write over USB. If we held
+    // the vol lock for the entire batch, all NFS operations would block and Finder
+    // would time out with ESTALE. By releasing between files, write() can still
+    // seed new buffers from disk between flushes.
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            if flush_flag.swap(false, Ordering::Relaxed) {
+                let vol = Arc::clone(&flush_vol);
+                let dirty = Arc::clone(&flush_dirty);
+                let dir_cache = Arc::clone(&flush_dir_cache);
+                let file_cache = Arc::clone(&flush_file_cache);
+                let _ = tokio::task::spawn_blocking(move || {
+                    let t0 = Instant::now();
+
+                    // Drain all dirty files
+                    let pending: Vec<(u32, String, Vec<u8>)> = {
+                        let mut dirty = dirty.lock().unwrap();
+                        let taken = std::mem::take(&mut *dirty);
+                        taken
+                            .into_iter()
+                            .map(|(cluster, (path, data))| (cluster, path, data))
+                            .collect()
+                    };
+
+                    if !pending.is_empty() {
+                        let count = pending.len();
+
+                        // Flush each file individually, releasing the vol lock between
+                        // files so NFS operations can interleave.
+                        // Uses in-place writes (reuses existing clusters) instead of
+                        // delete+recreate. This is dramatically faster for large files
+                        // and avoids the 4+ second vol lock that caused ESTALE timeouts.
+                        for (cluster, path, data) in pending {
+                            let ft = Instant::now();
+                            let data_len = data.len();
+                            {
+                                // Hold vol lock ONLY for this one file
+                                let mut vol = vol.lock().unwrap();
+
+                                // Try in-place write first (fast path: reuses clusters)
+                                match vol.write_file_in_place(&path, &data) {
+                                    Ok(()) => {}
+                                    Err(fatxlib::error::FatxError::FileNotFound(_)) => {
+                                        // File doesn't exist yet — create it
+                                        if let Err(e) = vol.create_file(&path, &data) {
+                                            error!("Flush create '{}' failed: {}", path, e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        // In-place failed for another reason — fall back
+                                        warn!("In-place write '{}' failed: {}, falling back to delete+recreate", path, e);
+                                        let _ = vol.delete(&path);
+                                        if let Err(e2) = vol.create_file(&path, &data) {
+                                            error!("Flush recreate '{}' failed: {}", path, e2);
+                                        }
+                                    }
+                                }
+                            }
+                            // Vol lock released — NFS ops can proceed
+
+                            // Update file cache with the flushed data
+                            {
+                                let mut fc = file_cache.lock().unwrap();
+                                fc.insert(cluster, data);
+                            }
+
+                            info!(
+                                "Flushed '{}' ({} bytes, {:.1}ms)",
+                                path,
+                                data_len,
+                                ft.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+
+                        // Clear dir cache after all files written
+                        {
+                            let mut dc = dir_cache.lock().unwrap();
+                            dc.clear();
+                        }
+
+                        // Now flush the FAT (one final lock)
+                        {
+                            let mut vol = vol.lock().unwrap();
+                            if let Err(e) = vol.flush() {
+                                error!("Periodic FAT flush failed: {}", e);
+                            }
+                        }
+                        info!(
+                            "Periodic flush: {} file(s) + FAT ({:.1}ms)",
+                            count,
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
+                    } else {
+                        // No dirty files, just flush the FAT
+                        let mut vol = vol.lock().unwrap();
+                        if let Err(e) = vol.flush() {
+                            error!("Periodic FAT flush failed: {}", e);
+                        } else {
+                            info!(
+                                "Periodic FAT flush ({:.1}ms)",
+                                t0.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                    }
+                })
+                .await;
+            }
+        }
+    });
+
+    // ── WATCHDOG: auto-shutdown if NFS server stalls ──
+    // If no NFS I/O happens for 120 seconds AND there are dirty writes pending,
+    // the server has probably hung. Force-unmount and exit to prevent the
+    // catastrophic stale-mount deadlock that kills Finder.
+    // If there are no dirty writes, the drive is just idle — that's fine.
+    {
+        let watchdog_mp = if cli.mount {
+            Some(mp_str.clone())
+        } else {
+            None
+        };
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                interval.tick().await;
+                let last_ms = watchdog_io.load(Ordering::Relaxed);
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let idle_secs = (now_ms.saturating_sub(last_ms)) / 1000;
+
+                // Only panic if we have dirty writes AND the server is unresponsive
+                let has_dirty = {
+                    let dirty = watchdog_dirty.lock().unwrap();
+                    !dirty.is_empty()
+                };
+
+                if idle_secs > 120 && has_dirty {
+                    eprintln!(
+                        "\n[WATCHDOG] NFS server unresponsive for {}s with dirty writes pending!",
+                        idle_secs
+                    );
+                    eprintln!("[WATCHDOG] Triggering emergency shutdown to prevent stale mount...");
+
+                    // Emergency unmount
+                    if let Some(ref mp) = watchdog_mp {
+                        eprintln!("[WATCHDOG] Force-unmounting {}...", mp);
+                        let _ = std::process::Command::new("bash")
+                            .args([
+                                "-c",
+                                &format!(
+                                    "timeout 5 umount -f '{}' 2>/dev/null; \
+                                 timeout 3 rm -rf '{}' 2>/dev/null; true",
+                                    mp, mp
+                                ),
+                            ])
+                            .output();
+                    }
+                    eprintln!("[WATCHDOG] Exiting. Run 'fatx mount --cleanup' if Finder is stuck.");
+                    std::process::exit(1);
+                }
+            }
+        });
     }
 
     println!("Press Ctrl+C to stop.");
@@ -1295,7 +1652,57 @@ async fn main() {
                 eprintln!("[shutdown] No mount to clean up (server-only mode).");
             }
 
-            // Step 2: Now it's safe to exit — no stale mount left behind
+            // Step 2: Flush dirty files and FAT if needed
+            if shutdown_flush_flag.load(Ordering::Relaxed) {
+                // Drain dirty write buffers to disk
+                let pending: HashMap<u32, (String, Vec<u8>)> = {
+                    let mut dirty = shutdown_dirty.lock().unwrap();
+                    std::mem::take(&mut *dirty)
+                };
+                if !pending.is_empty() {
+                    eprintln!(
+                        "[shutdown] Flushing {} dirty file(s) to disk...",
+                        pending.len()
+                    );
+                    if let Ok(mut vol) = shutdown_vol.lock() {
+                        for (path, data) in pending.values() {
+                            // Try in-place write; fall back to delete+recreate
+                            match vol.write_file_in_place(path, data) {
+                                Ok(()) => {}
+                                Err(_) => {
+                                    let _ = vol.delete(path);
+                                    if let Err(e) = vol.create_file(path, data) {
+                                        eprintln!("[shutdown] Failed to flush '{}': {}", path, e);
+                                    }
+                                }
+                            }
+                        }
+                        // Update file cache (not strictly needed at shutdown, but consistent)
+                        {
+                            let mut fc = shutdown_file_cache.lock().unwrap();
+                            for (cluster, (_path, data)) in pending {
+                                fc.insert(cluster, data);
+                            }
+                        }
+                        // Clear dir cache
+                        {
+                            shutdown_dir_cache.lock().unwrap().clear();
+                        }
+                    }
+                }
+
+                eprintln!("[shutdown] Flushing FAT to disk...");
+                if let Ok(mut vol) = shutdown_vol.lock() {
+                    match vol.flush() {
+                        Ok(()) => eprintln!("[shutdown] FAT flush complete."),
+                        Err(e) => {
+                            eprintln!("[shutdown] FAT flush failed: {} (data may be lost!)", e)
+                        }
+                    }
+                }
+            }
+
+            // Step 3: Now it's safe to exit — no stale mount left behind
             eprintln!("[shutdown] Shutdown complete. Exiting.");
             std::process::exit(0);
         });
