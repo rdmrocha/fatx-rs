@@ -1,0 +1,14 @@
+[package]
+name = "fatx-mkimage"
+version = "0.1.0"
+edition = "2021"
+description = "Create blank FATX/XTAF disk images for testing"
+
+[[bin]]
+name = "fatx-mkimage"
+path = "src/main.rs"
+
+[dependencies]
+fatxlib = { path = "../fatxlib" }
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"

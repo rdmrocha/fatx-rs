@@ -1,0 +1,20 @@
+[package]
+name = "fatx-mount"
+version = "0.1.0"
+edition = "2021"
+description = "Mount Xbox FATX/XTAF file systems via NFS (shows in Finder)"
+
+[[bin]]
+name = "fatx-mount"
+path = "src/main.rs"
+
+[dependencies]
+fatxlib = { path = "../fatxlib" }
+nfsserve = "0.11"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+libc = "0.2"
+chrono = "0.4"

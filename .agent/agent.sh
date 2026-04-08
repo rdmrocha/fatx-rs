@@ -1,17 +1,17 @@
 #!/bin/bash
-# fatx-agent: File-based RPC agent for fatx-cli
+# fatx-agent: File-based RPC agent for fatx
 #
-# Watches .agent/request.json for commands, executes them via fatx-cli,
+# Watches .agent/request.json for commands, executes them via fatx,
 # and writes results to .agent/response.json.
 #
 # Usage: sudo bash .agent/agent.sh [device]
 #   device: e.g. /dev/rdisk4 (default)
 
-# NOTE: no set -e — we want the agent to survive fatx-cli errors
+# NOTE: no set -e — we want the agent to survive fatx errors
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-CLI="$PROJECT_DIR/target/release/fatx-cli"
+CLI="$PROJECT_DIR/target/release/fatx"
 AGENT_DIR="$SCRIPT_DIR"
 REQUEST="$AGENT_DIR/request.json"
 RESPONSE="$AGENT_DIR/response.json"
@@ -19,7 +19,7 @@ LOCK="$AGENT_DIR/processing"
 DEVICE="${1:-/dev/rdisk4}"
 
 if [ ! -f "$CLI" ]; then
-    echo "WARN: fatx-cli not found at $CLI — will build on first request or 'build' command."
+    echo "WARN: fatx not found at $CLI — will build on first request or 'build' command."
 fi
 
 echo "╔══════════════════════════════════════════╗"
@@ -196,14 +196,14 @@ for a in args:
             fi
             echo "[$TIMESTAMP]   Test done (exit=$EXIT_CODE)"
         else
-            echo "[$TIMESTAMP] > fatx-cli --json $COMMAND $DEVICE ${EXTRA_ARGS[*]}"
+            echo "[$TIMESTAMP] > fatx --json $COMMAND $DEVICE ${EXTRA_ARGS[*]}"
 
             # Execute — capture both stdout and stderr, never let it kill the agent
             OUTPUT=$("$CLI" --json "$COMMAND" "$DEVICE" "${EXTRA_ARGS[@]}" 2>&1) || true
             EXIT_CODE=${PIPESTATUS[0]:-$?}
 
             if [ -z "$OUTPUT" ]; then
-                OUTPUT="{\"error\":\"fatx-cli exited with code $EXIT_CODE and no output\"}"
+                OUTPUT="{\"error\":\"fatx exited with code $EXIT_CODE and no output\"}"
             fi
             echo "[$TIMESTAMP]   Done (exit=$EXIT_CODE, ${#OUTPUT} bytes)"
         fi
