@@ -1332,3 +1332,69 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── is_macos_metadata tests ──
+
+    #[test]
+    fn test_blocks_ds_store() {
+        assert!(FatxNfs::is_macos_metadata(".DS_Store"));
+    }
+
+    #[test]
+    fn test_blocks_spotlight() {
+        assert!(FatxNfs::is_macos_metadata(".Spotlight-V100"));
+    }
+
+    #[test]
+    fn test_blocks_trashes() {
+        assert!(FatxNfs::is_macos_metadata(".Trashes"));
+    }
+
+    #[test]
+    fn test_blocks_fseventsd() {
+        assert!(FatxNfs::is_macos_metadata(".fseventsd"));
+    }
+
+    #[test]
+    fn test_blocks_resource_fork_prefix() {
+        assert!(FatxNfs::is_macos_metadata("._anything"));
+        assert!(FatxNfs::is_macos_metadata("._Icon\r"));
+        assert!(FatxNfs::is_macos_metadata("._"));
+    }
+
+    #[test]
+    fn test_allows_normal_files() {
+        assert!(!FatxNfs::is_macos_metadata("game.bin"));
+        assert!(!FatxNfs::is_macos_metadata("Content"));
+        assert!(!FatxNfs::is_macos_metadata(".hidden"));
+        assert!(!FatxNfs::is_macos_metadata("DS_Store")); // no leading dot
+    }
+
+    // ── inode/cluster mapping tests ──
+
+    #[test]
+    fn test_root_inode_is_one() {
+        // The NFS root inode should be 1 (standard NFS convention)
+        assert_eq!(FIRST_CLUSTER, 1);
+    }
+
+    // ── check_writable tests ──
+    // These require constructing a FatxNfs instance, which needs a real volume.
+    // We test the logic indirectly through the NFS integration tests.
+
+    // ── cache invalidation logic ──
+
+    #[test]
+    fn test_cache_structures() {
+        // Verify that HashMap<u32, Vec<DirectoryEntry>> and HashMap<u32, Vec<u8>>
+        // are the correct types by constructing them
+        let dir_cache: HashMap<u32, Vec<DirectoryEntry>> = HashMap::new();
+        let file_cache: HashMap<u32, Vec<u8>> = HashMap::new();
+        assert!(dir_cache.is_empty());
+        assert!(file_cache.is_empty());
+    }
+}

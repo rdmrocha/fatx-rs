@@ -8,20 +8,53 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  # ── Gate: all checks must pass before building release artifacts ──
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace
+
+  # ── Build release binaries for each platform ──
   build:
+    needs: test
     strategy:
       matrix:
         include:
           - target: x86_64-apple-darwin
             os: macos-14
-            name: fatx-cli-macos-x86_64
+            name: fatx-macos-x86_64
           - target: aarch64-apple-darwin
             os: macos-14
-            name: fatx-cli-macos-arm64
+            name: fatx-macos-arm64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            name: fatx-cli-linux-x86_64
+            name: fatx-linux-x86_64
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -32,13 +65,23 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
 
-      - name: Package binary
+      - name: Build release binaries
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Package binaries
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.name }}.tar.gz fatx-cli
+          tar czf ../../../${{ matrix.name }}.tar.gz fatx fatx-mount fatx-mkimage
           cd ../../..
 
       - name: Upload artifact
@@ -47,6 +90,7 @@ jobs:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}.tar.gz
 
+  # ── Create GitHub Release with all artifacts ──
   release:
     needs: build
     runs-on: ubuntu-latest

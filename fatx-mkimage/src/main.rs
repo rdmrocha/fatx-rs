@@ -361,3 +361,266 @@ fn main() {
     println!("  fatx ls {} /", cli.output.display());
     println!("  sudo fatx-mount {} -v", cli.output.display());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    // ── parse_size tests ──
+
+    #[test]
+    fn test_parse_size_gigabytes() {
+        assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("2g").unwrap(), 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_megabytes() {
+        assert_eq!(parse_size("512M").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_size("64m").unwrap(), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_kilobytes() {
+        assert_eq!(parse_size("1024K").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("256k").unwrap(), 256 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_bytes() {
+        assert_eq!(parse_size("4096").unwrap(), 4096);
+    }
+
+    #[test]
+    fn test_parse_size_fractional() {
+        assert_eq!(
+            parse_size("1.5G").unwrap(),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
+        assert_eq!(parse_size("0.5M").unwrap(), 512 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_invalid() {
+        assert!(parse_size("abc").is_err());
+        assert!(parse_size("").is_err());
+        assert!(parse_size("G").is_err());
+    }
+
+    #[test]
+    fn test_parse_size_whitespace() {
+        assert_eq!(parse_size("  1G  ").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    // ── format_bytes tests ──
+
+    #[test]
+    fn test_format_bytes_display() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
+    }
+
+    // ── format_image tests ──
+
+    #[test]
+    fn test_format_fatx_image() {
+        let tmp = NamedTempFile::new().expect("create tmp");
+        let path = tmp.path().to_path_buf();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open");
+
+        let size = 8 * 1024 * 1024; // 8 MB
+        format_image(&mut file, size, false, 32).expect("format FATX");
+
+        // Verify the image is a valid FATX volume
+        drop(file);
+        let f = File::open(&path).expect("reopen");
+        let vol = FatxVolume::open(f, 0, 0).expect("open as FATX volume");
+        assert_eq!(&vol.superblock.magic, b"FATX");
+    }
+
+    #[test]
+    fn test_format_xtaf_image() {
+        let tmp = NamedTempFile::new().expect("create tmp");
+        let path = tmp.path().to_path_buf();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open");
+
+        let size = 8 * 1024 * 1024; // 8 MB
+        format_image(&mut file, size, true, 32).expect("format XTAF");
+
+        drop(file);
+        let f = File::open(&path).expect("reopen");
+        let vol = FatxVolume::open(f, 0, 0).expect("open as XTAF volume");
+        assert_eq!(&vol.superblock.magic, b"XTAF");
+    }
+
+    #[test]
+    fn test_format_image_various_spc() {
+        for spc in [1, 2, 4, 8, 16, 32, 64, 128] {
+            let tmp = NamedTempFile::new().expect("create tmp");
+            let path = tmp.path().to_path_buf();
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .truncate(true)
+                .open(&path)
+                .expect("open");
+
+            let size = 8 * 1024 * 1024;
+            format_image(&mut file, size, false, spc).expect(&format!("format spc={}", spc));
+
+            drop(file);
+            let f = File::open(&path).expect("reopen");
+            FatxVolume::open(f, 0, 0).expect(&format!("valid volume spc={}", spc));
+        }
+    }
+
+    #[test]
+    fn test_format_large_image_fat32() {
+        // 2GB should trigger FAT32
+        let tmp = NamedTempFile::new().expect("create tmp");
+        let path = tmp.path().to_path_buf();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open");
+
+        let size = 2u64 * 1024 * 1024 * 1024;
+        format_image(&mut file, size, false, 32).expect("format 2GB");
+
+        drop(file);
+        let f = File::open(&path).expect("reopen");
+        let vol = FatxVolume::open(f, 0, 0).expect("open");
+        assert_eq!(vol.fat_type, fatxlib::types::FatType::Fat32);
+    }
+
+    #[test]
+    fn test_format_small_image_fat16() {
+        let tmp = NamedTempFile::new().expect("create tmp");
+        let path = tmp.path().to_path_buf();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open");
+
+        let size = 8 * 1024 * 1024; // 8 MB → FAT16
+        format_image(&mut file, size, false, 32).expect("format 8MB");
+
+        drop(file);
+        let f = File::open(&path).expect("reopen");
+        let vol = FatxVolume::open(f, 0, 0).expect("open");
+        assert_eq!(vol.fat_type, fatxlib::types::FatType::Fat16);
+    }
+
+    // ── populate_image tests ──
+
+    #[test]
+    fn test_populate_creates_directories_and_files() {
+        let tmp = NamedTempFile::new().expect("create tmp");
+        let path = tmp.path().to_path_buf();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open");
+
+        let size = 64 * 1024 * 1024; // 64 MB for populate
+        format_image(&mut file, size, false, 32).expect("format");
+        drop(file);
+
+        populate_image(&path).expect("populate");
+
+        // Verify the structure by opening and reading
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("reopen");
+        let mut vol = FatxVolume::open(f, 0, 0).expect("open");
+
+        // Check directories exist
+        vol.resolve_path("/Content").expect("Content exists");
+        vol.resolve_path("/Content/0000000000000000")
+            .expect("profile exists");
+        vol.resolve_path("/Cache").expect("Cache exists");
+        vol.resolve_path("/Apps").expect("Apps exists");
+        vol.resolve_path("/Apps/Aurora").expect("Aurora exists");
+
+        // Check files exist and read back correctly
+        let data = vol.read_file_by_path("/name.txt").expect("read name.txt");
+        assert_eq!(&data, b"Test Xbox 360\n");
+
+        // Check the medium file
+        let config_entry = vol
+            .resolve_path("/Apps/Aurora/config.bin")
+            .expect("config.bin exists");
+        assert_eq!(config_entry.file_size, 65536);
+
+        // Check the large file
+        let large_entry = vol
+            .resolve_path("/Content/testfile_1mb.bin")
+            .expect("1mb file exists");
+        assert_eq!(large_entry.file_size, 1_048_576);
+
+        // Check save files
+        let save_dir = vol
+            .resolve_path("/Content/0000000000000000/FFFE07D1")
+            .expect("game dir exists");
+        let entries = vol
+            .read_directory(save_dir.first_cluster)
+            .expect("readdir saves");
+        assert_eq!(entries.len(), 20);
+    }
+
+    #[test]
+    fn test_populate_xtaf_image() {
+        let tmp = NamedTempFile::new().expect("create tmp");
+        let path = tmp.path().to_path_buf();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open");
+
+        let size = 64 * 1024 * 1024;
+        format_image(&mut file, size, true, 32).expect("format XTAF");
+        drop(file);
+
+        populate_image(&path).expect("populate XTAF");
+
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("reopen");
+        let mut vol = FatxVolume::open(f, 0, 0).expect("open");
+        assert_eq!(&vol.superblock.magic, b"XTAF");
+        vol.resolve_path("/Content").expect("Content exists");
+        vol.resolve_path("/Apps/Aurora").expect("Aurora exists");
+    }
+}

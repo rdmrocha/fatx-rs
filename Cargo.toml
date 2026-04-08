@@ -22,5 +22,8 @@ base64 = "0.22"
 ratatui = "0.30"
 crossterm = "0.29"
 
+[dev-dependencies]
+tempfile = "3"
+
 [workspace]
 members = [".", "fatxlib", "fatx-mount", "fatx-mkimage"]
