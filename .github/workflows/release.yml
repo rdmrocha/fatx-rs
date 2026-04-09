@@ -40,11 +40,10 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-
       - name: Security audit
-        run: cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ── Build release binaries for each platform ──
   build:
