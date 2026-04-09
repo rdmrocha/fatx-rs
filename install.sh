@@ -10,7 +10,7 @@
 #   bash install.sh
 #
 # Options:
-#   FATX_VERSION=v0.2.1-alpha bash install.sh   # install a specific version
+#   FATX_VERSION=v0.2.0 bash install.sh           # install a specific version
 #   FATX_INSTALL_DIR=~/.local/bin bash install.sh  # custom install directory
 
 set -e
@@ -101,9 +101,9 @@ if [[ "$HTTP_CODE" != "200" ]] || [[ ! -s "$TMP_DIR/fatx.tar.gz" ]]; then
     echo ""
     echo -e "  This can happen if:"
     echo -e "  - The release hasn't published binaries yet"
-    echo -e "  - This is an alpha/pre-release tag"
+    echo -e "  - This is a pre-release tag"
     echo ""
-    echo -e "  ${BOLD}You can build from source instead:${NC}"
+    echo -e "  ${BOLD}Build from source instead:${NC}"
     echo -e "    git clone https://github.com/$REPO.git"
     echo -e "    cd fatx-rs"
     echo -e "    bash setup.sh"
@@ -168,12 +168,14 @@ fi
 echo ""
 info "Quick start"
 echo ""
-echo "  Plug in your Xbox drive, then:"
+echo "  Plug in your Xbox 360 drive, then:"
 echo ""
-echo -e "    ${GREEN}sudo fatx scan /dev/rdisk4${NC}          # find partitions"
-echo -e "    ${GREEN}sudo fatx ls /dev/rdisk4 /${NC}           # list root directory"
-echo -e "    ${GREEN}sudo fatx mount /dev/rdisk4 --mount${NC}  # mount in Finder"
-echo -e "    ${GREEN}sudo fatx${NC}                            # interactive mode"
+echo -e "    ${GREEN}diskutil list | grep external${NC}                    # find your device"
+echo -e "    ${GREEN}diskutil unmountDisk /dev/diskN${NC}                  # unmount macOS"
+echo -e "    ${GREEN}sudo fatx scan /dev/rdiskN${NC}                      # find Xbox partitions"
+echo -e "    ${GREEN}sudo fatx ls /dev/rdiskN --partition \"360 Data\" /${NC}  # list files"
+echo -e "    ${GREEN}sudo fatx mount /dev/rdiskN --partition \"360 Data\" --mount${NC}  # Finder"
+echo -e "    ${GREEN}sudo fatx${NC}                                        # interactive mode"
 echo ""
 echo -e "  For full help: ${DIM}fatx --help${NC}"
 echo ""

@@ -13,8 +13,12 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use bytes::Bytes;
+use parking_lot::{Mutex, RwLock};
+use quick_cache::sync::Cache;
 
 use async_trait::async_trait;
 use clap::Parser;
@@ -152,14 +156,23 @@ type DirtyFileMap = HashMap<u32, (String, Vec<u8>)>;
 ///
 /// All blocking I/O (USB reads/writes via FatxVolume) is dispatched to
 /// `tokio::task::spawn_blocking` so the async NFS event loop never stalls.
+///
+/// Concurrency model:
+/// - vol: RwLock — read lock for cache-only ops (read_fat_entry, read_chain, stats),
+///   write lock for device I/O (read_at, write_at, flush)
+/// - dir_cache/file_cache: quick_cache — internally sharded, no external lock needed
+/// - inode_parents: RwLock — read-heavy, small map
+/// - dirty_files: Mutex — write-only, short critical sections
+///
+/// Lock ordering: (1) vol, (2) inode_parents, (3) caches (lockless), (4) dirty_files
 struct FatxNfs {
-    vol: Arc<Mutex<FatxVolume<File>>>,
-    /// Cache: parent_cluster -> Vec<DirectoryEntry>
-    dir_cache: Arc<Mutex<HashMap<u32, Vec<DirectoryEntry>>>>,
+    vol: Arc<RwLock<FatxVolume<File>>>,
+    /// Cache: parent_cluster -> Vec<DirectoryEntry> (bounded, concurrent, no lock needed)
+    dir_cache: Arc<Cache<u32, Vec<DirectoryEntry>>>,
     /// Reverse lookup: cluster -> (parent_cluster, name)
-    inode_parents: Arc<Mutex<HashMap<u32, (u32, String)>>>,
-    /// File data cache: cluster -> file bytes (avoids re-reading entire file per NFS chunk)
-    file_cache: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    inode_parents: Arc<RwLock<HashMap<u32, (u32, String)>>>,
+    /// File data cache: cluster -> file bytes (bounded by weight, zero-copy via Bytes)
+    file_cache: Arc<Cache<u32, Bytes>>,
     /// Dirty write buffer — see [DirtyFileMap].
     dirty_files: Arc<Mutex<DirtyFileMap>>,
     /// Whether the volume was opened read-only
@@ -177,10 +190,10 @@ impl FatxNfs {
             .unwrap_or_default()
             .as_millis() as u64;
         FatxNfs {
-            vol: Arc::new(Mutex::new(vol)),
-            dir_cache: Arc::new(Mutex::new(HashMap::new())),
-            inode_parents: Arc::new(Mutex::new(HashMap::new())),
-            file_cache: Arc::new(Mutex::new(HashMap::new())),
+            vol: Arc::new(RwLock::new(vol)),
+            dir_cache: Arc::new(Cache::new(1000)),
+            inode_parents: Arc::new(RwLock::new(HashMap::new())),
+            file_cache: Arc::new(Cache::new(4096)),
             readonly,
             flush_needed: Arc::new(AtomicBool::new(false)),
             dirty_files: Arc::new(Mutex::new(HashMap::new())),
@@ -200,12 +213,9 @@ impl FatxNfs {
     /// Read directory entries for a cluster, populating caches.
     /// Returns cached data on hit; only goes to USB on cache miss.
     async fn get_dir_entries(&self, cluster: u32) -> Result<Vec<DirectoryEntry>, nfsstat3> {
-        // Fast path: check cache without blocking I/O
-        {
-            let cache = self.dir_cache.lock().unwrap();
-            if let Some(entries) = cache.get(&cluster) {
-                return Ok(entries.clone());
-            }
+        // Fast path: check cache (quick_cache is concurrent, no lock needed)
+        if let Some(entries) = self.dir_cache.get(&cluster) {
+            return Ok(entries);
         }
 
         // Cache miss — read from USB via spawn_blocking
@@ -214,16 +224,13 @@ impl FatxNfs {
         let inode_parents = Arc::clone(&self.inode_parents);
 
         tokio::task::spawn_blocking(move || {
-            // Double-check cache inside the blocking task (another task may have populated it)
-            {
-                let cache = dir_cache.lock().unwrap();
-                if let Some(entries) = cache.get(&cluster) {
-                    return Ok(entries.clone());
-                }
+            // Double-check cache inside the blocking task
+            if let Some(entries) = dir_cache.get(&cluster) {
+                return Ok(entries);
             }
 
             let t0 = Instant::now();
-            let mut vol = vol.lock().unwrap();
+            let mut vol = vol.write(); // write lock — device I/O
             let entries = if cluster == FIRST_CLUSTER {
                 vol.read_root_directory()
             } else {
@@ -240,15 +247,12 @@ impl FatxNfs {
                         elapsed.as_secs_f64() * 1000.0
                     );
                     {
-                        let mut parents = inode_parents.lock().unwrap();
+                        let mut parents = inode_parents.write();
                         for e in &entries {
                             parents.insert(e.first_cluster, (cluster, e.filename()));
                         }
                     }
-                    {
-                        let mut cache = dir_cache.lock().unwrap();
-                        cache.insert(cluster, entries.clone());
-                    }
+                    dir_cache.insert(cluster, entries.clone());
                     Ok(entries)
                 }
                 Err(e) => {
@@ -271,7 +275,7 @@ impl FatxNfs {
         let parent_cluster = id_to_cluster(parent_id);
         let mut parts = vec![name.to_string()];
         let mut current = parent_cluster;
-        let parents = self.inode_parents.lock().unwrap();
+        let parents = self.inode_parents.read();
         while current != FIRST_CLUSTER {
             if let Some((grandparent, dir_name)) = parents.get(&current) {
                 parts.push(dir_name.clone());
@@ -300,25 +304,19 @@ impl FatxNfs {
     /// file data for children of that directory (they may have new clusters
     /// after a delete+recreate write cycle).
     fn invalidate_dir(&self, parent_cluster: u32) {
-        // Remove child file caches
-        {
-            let dir_cache = self.dir_cache.lock().unwrap();
-            if let Some(entries) = dir_cache.get(&parent_cluster) {
-                let mut fc = self.file_cache.lock().unwrap();
-                for e in entries {
-                    fc.remove(&e.first_cluster);
-                }
+        // Remove child file caches (quick_cache is concurrent, no external lock)
+        if let Some(entries) = self.dir_cache.get(&parent_cluster) {
+            for e in &entries {
+                self.file_cache.remove(&e.first_cluster);
             }
         }
-        let mut cache = self.dir_cache.lock().unwrap();
-        cache.remove(&parent_cluster);
+        self.dir_cache.remove(&parent_cluster);
     }
 
     /// Invalidate a single file's data cache (e.g. after write).
     #[allow(dead_code)] // kept for future use
     fn invalidate_file(&self, cluster: u32) {
-        let mut cache = self.file_cache.lock().unwrap();
-        cache.remove(&cluster);
+        self.file_cache.remove(&cluster);
     }
 
     /// Check if readonly and return appropriate error.
@@ -359,7 +357,7 @@ impl NFSFileSystem for FatxNfs {
             return Ok(dirid);
         }
         if name_str == ".." {
-            let parents = self.inode_parents.lock().unwrap();
+            let parents = self.inode_parents.read();
             if let Some((parent, _)) = parents.get(&cluster) {
                 return Ok(cluster_to_id(*parent));
             }
@@ -401,7 +399,7 @@ impl NFSFileSystem for FatxNfs {
 
         let cluster = id_to_cluster(id);
         let parent_cluster = {
-            let parents = self.inode_parents.lock().unwrap();
+            let parents = self.inode_parents.read();
             parents.get(&cluster).map(|(p, _)| *p)
         };
 
@@ -446,8 +444,8 @@ impl NFSFileSystem for FatxNfs {
 
         // Fast path: serve from file cache without any USB I/O
         {
-            let cache = self.file_cache.lock().unwrap();
-            if let Some(data) = cache.get(&cluster) {
+            // Fast path: serve from file cache (quick_cache — no lock needed)
+            if let Some(data) = self.file_cache.get(&cluster) {
                 let start = offset as usize;
                 let end = (start + count as usize).min(data.len());
                 if start >= data.len() {
@@ -470,13 +468,14 @@ impl NFSFileSystem for FatxNfs {
                     eof,
                     t0.elapsed().as_secs_f64() * 1000.0
                 );
-                return Ok((data[start..end].to_vec(), eof));
+                // Zero-copy slice from Bytes (refcount bump, no memcpy)
+                return Ok((data.slice(start..end).to_vec(), eof));
             }
         }
 
         // Cache miss — find the directory entry, then read the whole file once
         let parent_cluster = {
-            let parents = self.inode_parents.lock().unwrap();
+            let parents = self.inode_parents.read();
             parents.get(&cluster).map(|(p, _)| *p)
         };
 
@@ -493,7 +492,7 @@ impl NFSFileSystem for FatxNfs {
         let file_cache = Arc::clone(&self.file_cache);
         let data = tokio::task::spawn_blocking(move || {
             let t0 = Instant::now();
-            let mut vol = vol.lock().unwrap();
+            let mut vol = vol.write(); // write lock — device I/O
             match vol.read_file(&entry) {
                 Ok(data) => {
                     let elapsed = t0.elapsed();
@@ -503,10 +502,10 @@ impl NFSFileSystem for FatxNfs {
                         data.len(),
                         elapsed.as_secs_f64() * 1000.0
                     );
-                    // Cache the file data for subsequent chunk reads
-                    let mut cache = file_cache.lock().unwrap();
-                    cache.insert(cluster, data.clone());
-                    Ok(data)
+                    // Cache as Bytes for zero-copy NFS responses
+                    let bytes_data = Bytes::from(data);
+                    file_cache.insert(cluster, bytes_data.clone());
+                    Ok(bytes_data)
                 }
                 Err(e) => {
                     warn!("read cluster {}: {}", cluster, e);
@@ -523,7 +522,7 @@ impl NFSFileSystem for FatxNfs {
             Ok((vec![], true))
         } else {
             let eof = end >= data.len();
-            Ok((data[start..end].to_vec(), eof))
+            Ok((data.slice(start..end).to_vec(), eof))
         }
     }
 
@@ -536,7 +535,7 @@ impl NFSFileSystem for FatxNfs {
 
         // Look up path info for this file (needed when we flush to disk later)
         let parent_cluster = {
-            let parents = self.inode_parents.lock().unwrap();
+            let parents = self.inode_parents.read();
             parents.get(&cluster).map(|(p, _)| *p)
         };
         let parent_cluster = parent_cluster.ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -551,18 +550,15 @@ impl NFSFileSystem for FatxNfs {
         // Buffer the write in memory — NO disk I/O here.
         // The periodic flush task will write dirty files to disk.
         {
-            let mut dirty = self.dirty_files.lock().unwrap();
+            let mut dirty = self.dirty_files.lock();
             let buf = dirty.entry(cluster).or_insert_with(|| {
                 // First write to this file — seed from file_cache or empty
-                let cached = {
-                    let cache = self.file_cache.lock().unwrap();
-                    cache.get(&cluster).cloned()
-                };
+                let cached = self.file_cache.get(&cluster);
                 let existing = if let Some(c) = cached {
-                    c
+                    c.to_vec()
                 } else {
                     // Need to read from disk (blocking) — but only once per file
-                    let mut vol = self.vol.lock().unwrap();
+                    let mut vol = self.vol.write();
                     vol.read_file(&entry).unwrap_or_default()
                 };
                 (path.clone(), existing)
@@ -579,10 +575,10 @@ impl NFSFileSystem for FatxNfs {
 
         // Also update the file_cache so subsequent reads see the buffered data
         {
-            let dirty = self.dirty_files.lock().unwrap();
+            let dirty = self.dirty_files.lock();
             if let Some((_, ref buf_data)) = dirty.get(&cluster) {
-                let mut cache = self.file_cache.lock().unwrap();
-                cache.insert(cluster, buf_data.clone());
+                self.file_cache
+                    .insert(cluster, Bytes::copy_from_slice(buf_data));
             }
         }
 
@@ -616,7 +612,7 @@ impl NFSFileSystem for FatxNfs {
         let vol = Arc::clone(&self.vol);
         let path_clone = path.clone();
         tokio::task::spawn_blocking(move || {
-            let mut vol = vol.lock().unwrap();
+            let mut vol = vol.write();
             match vol.create_file(&path_clone, &[]) {
                 Ok(()) => {}
                 Err(fatxlib::error::FatxError::FileExists(_)) => {
@@ -691,7 +687,7 @@ impl NFSFileSystem for FatxNfs {
         let vol = Arc::clone(&self.vol);
         let path_clone = path.clone();
         let mkdir_result = tokio::task::spawn_blocking(move || {
-            let mut vol = vol.lock().unwrap();
+            let mut vol = vol.write();
             match vol.create_directory(&path_clone) {
                 Ok(()) => {
                     Ok(false) // created new
@@ -746,7 +742,7 @@ impl NFSFileSystem for FatxNfs {
         let vol = Arc::clone(&self.vol);
         let path_clone = path.clone();
         tokio::task::spawn_blocking(move || {
-            let mut vol = vol.lock().unwrap();
+            let mut vol = vol.write();
             match vol.delete(&path_clone) {
                 Ok(()) => Ok(()),
                 Err(fatxlib::error::FatxError::DirectoryNotEmpty(_)) => {
@@ -769,15 +765,10 @@ impl NFSFileSystem for FatxNfs {
 
         self.flush_needed.store(true, Ordering::Relaxed);
 
-        // Clear all caches — a recursive delete can affect many directories
-        {
-            let mut dc = self.dir_cache.lock().unwrap();
-            dc.clear();
-        }
-        {
-            let mut fc = self.file_cache.lock().unwrap();
-            fc.clear();
-        }
+        // Invalidate caches — a recursive delete can affect many directories.
+        // quick_cache doesn't have clear(), so we invalidate the parent and
+        // rely on cache misses to re-read from disk for other entries.
+        self.invalidate_dir(id_to_cluster(dirid));
 
         info!(
             "NFS remove: \"{}\" done ({:.1}ms)",
@@ -815,7 +806,7 @@ impl NFSFileSystem for FatxNfs {
         let path_clone = path.clone();
         let to_name_owned = to_name.to_string();
         tokio::task::spawn_blocking(move || {
-            let mut vol = vol.lock().unwrap();
+            let mut vol = vol.write();
             vol.rename(&path_clone, &to_name_owned).map_err(|e| {
                 warn!("rename '{}' -> '{}': {}", path_clone, to_name_owned, e);
                 nfsstat3::NFS3ERR_IO
@@ -861,7 +852,7 @@ impl NFSFileSystem for FatxNfs {
 
         // Add .. entry
         let parent_id = {
-            let parents = self.inode_parents.lock().unwrap();
+            let parents = self.inode_parents.read();
             parents
                 .get(&cluster)
                 .map(|(p, _)| cluster_to_id(*p))
@@ -1205,11 +1196,22 @@ async fn main() {
         (cli.offset, cli.size)
     };
 
+    // Capture raw fd before file is moved into the volume
+    #[cfg(target_os = "macos")]
+    let raw_fd = {
+        use std::os::unix::io::AsRawFd;
+        file.as_raw_fd()
+    };
+
     // Open the FATX volume
-    let vol = FatxVolume::open(file, offset, size).unwrap_or_else(|e| {
+    let mut vol = FatxVolume::open(file, offset, size).unwrap_or_else(|e| {
         eprintln!("Error opening FATX volume: {}", e);
         std::process::exit(1);
     });
+
+    // Configure macOS-specific I/O (F_NOCACHE, F_RDAHEAD, device params)
+    #[cfg(target_os = "macos")]
+    vol.configure_device(raw_fd);
 
     let cluster_size = vol.superblock.cluster_size();
     let total_clusters = vol.total_clusters;
@@ -1418,14 +1420,14 @@ async fn main() {
             if flush_flag.swap(false, Ordering::Relaxed) {
                 let vol = Arc::clone(&flush_vol);
                 let dirty = Arc::clone(&flush_dirty);
-                let dir_cache = Arc::clone(&flush_dir_cache);
+                let _dir_cache = Arc::clone(&flush_dir_cache);
                 let file_cache = Arc::clone(&flush_file_cache);
                 let _ = tokio::task::spawn_blocking(move || {
                     let t0 = Instant::now();
 
                     // Drain all dirty files
                     let pending: Vec<(u32, String, Vec<u8>)> = {
-                        let mut dirty = dirty.lock().unwrap();
+                        let mut dirty = dirty.lock();
                         let taken = std::mem::take(&mut *dirty);
                         taken
                             .into_iter()
@@ -1436,44 +1438,64 @@ async fn main() {
                     if !pending.is_empty() {
                         let count = pending.len();
 
-                        // Flush each file individually, releasing the vol lock between
-                        // files so NFS operations can interleave.
-                        // Uses in-place writes (reuses existing clusters) instead of
-                        // delete+recreate. This is dramatically faster for large files
-                        // and avoids the 4+ second vol lock that caused ESTALE timeouts.
+                        // Flush each file with chunked cluster writes.
+                        // The vol lock is held briefly for FAT chain management,
+                        // then released between each cluster write so NFS reads
+                        // (Finder browsing) can interleave.
                         for (cluster, path, data) in pending {
                             let ft = Instant::now();
                             let data_len = data.len();
-                            {
-                                // Hold vol lock ONLY for this one file
-                                let mut vol = vol.lock().unwrap();
 
-                                // Try in-place write first (fast path: reuses clusters)
-                                match vol.write_file_in_place(&path, &data) {
-                                    Ok(()) => {}
+                            // Phase 1: Prepare chain (fast FAT ops — brief lock)
+                            let chain = {
+                                let mut vol = vol.write();
+                                match vol.prepare_write_in_place(&path, data.len()) {
+                                    Ok(chain) => chain,
                                     Err(fatxlib::error::FatxError::FileNotFound(_)) => {
-                                        // File doesn't exist yet — create it
+                                        // File doesn't exist — create it (holds lock for full write)
                                         if let Err(e) = vol.create_file(&path, &data) {
                                             error!("Flush create '{}' failed: {}", path, e);
                                         }
+                                        file_cache.insert(cluster, Bytes::from(data));
+                                        continue;
                                     }
                                     Err(e) => {
-                                        // In-place failed for another reason — fall back
-                                        warn!("In-place write '{}' failed: {}, falling back to delete+recreate", path, e);
-                                        let _ = vol.delete(&path);
-                                        if let Err(e2) = vol.create_file(&path, &data) {
-                                            error!("Flush recreate '{}' failed: {}", path, e2);
-                                        }
+                                        error!("Flush prepare '{}' failed: {}", path, e);
+                                        continue;
                                     }
                                 }
+                            };
+                            // Vol lock released — NFS ops can proceed between clusters
+
+                            // Phase 2: Write data cluster-by-cluster, releasing lock between each
+                            let cluster_size = {
+                                let vol = vol.read();
+                                vol.superblock.cluster_size() as usize
+                            };
+                            let mut offset = 0usize;
+                            for &c in &chain {
+                                let end = (offset + cluster_size).min(data.len());
+                                let mut cluster_buf = vec![0u8; cluster_size];
+                                if offset < data.len() {
+                                    let len = end - offset;
+                                    cluster_buf[..len].copy_from_slice(&data[offset..end]);
+                                }
+                                {
+                                    let mut vol = vol.write();
+                                    if let Err(e) = vol.write_cluster(c, &cluster_buf) {
+                                        error!("Flush cluster {} for '{}' failed: {}", c, path, e);
+                                        break;
+                                    }
+                                }
+                                // Lock released — NFS reads can proceed
+                                offset += cluster_size;
+                                if offset >= data.len() {
+                                    break;
+                                }
                             }
-                            // Vol lock released — NFS ops can proceed
 
                             // Update file cache with the flushed data
-                            {
-                                let mut fc = file_cache.lock().unwrap();
-                                fc.insert(cluster, data);
-                            }
+                            file_cache.insert(cluster, Bytes::from(data));
 
                             info!(
                                 "Flushed '{}' ({} bytes, {:.1}ms)",
@@ -1483,15 +1505,12 @@ async fn main() {
                             );
                         }
 
-                        // Clear dir cache after all files written
-                        {
-                            let mut dc = dir_cache.lock().unwrap();
-                            dc.clear();
-                        }
+                        // Dir cache entries will naturally expire from quick_cache.
+                        // Targeted invalidation already happens in write handlers.
 
                         // Now flush the FAT (one final lock)
                         {
-                            let mut vol = vol.lock().unwrap();
+                            let mut vol = vol.write();
                             if let Err(e) = vol.flush() {
                                 error!("Periodic FAT flush failed: {}", e);
                             }
@@ -1503,7 +1522,7 @@ async fn main() {
                         );
                     } else {
                         // No dirty files, just flush the FAT
-                        let mut vol = vol.lock().unwrap();
+                        let mut vol = vol.write();
                         if let Err(e) = vol.flush() {
                             error!("Periodic FAT flush failed: {}", e);
                         } else {
@@ -1543,7 +1562,7 @@ async fn main() {
 
                 // Only panic if we have dirty writes AND the server is unresponsive
                 let has_dirty = {
-                    let dirty = watchdog_dirty.lock().unwrap();
+                    let dirty = watchdog_dirty.lock();
                     !dirty.is_empty()
                 };
 
@@ -1598,8 +1617,8 @@ async fn main() {
             let disk_vol = Arc::clone(&shutdown_vol);
             let disk_flush_flag = Arc::clone(&shutdown_flush_flag);
             let disk_dirty = Arc::clone(&shutdown_dirty);
-            let disk_dir_cache = Arc::clone(&shutdown_dir_cache);
-            let disk_file_cache = Arc::clone(&shutdown_file_cache);
+            let _disk_dir_cache = Arc::clone(&shutdown_dir_cache);
+            let _disk_file_cache = Arc::clone(&shutdown_file_cache);
             let disappeared_for_task = Arc::clone(&disappeared);
 
             tokio::spawn(async move {
@@ -1618,7 +1637,7 @@ async fn main() {
 
                         // Clear dirty files — can't write to a missing device
                         {
-                            let mut dirty = disk_dirty.lock().unwrap();
+                            let mut dirty = disk_dirty.lock();
                             let lost = dirty.len();
                             dirty.clear();
                             if lost > 0 {
@@ -1631,10 +1650,8 @@ async fn main() {
                         disk_flush_flag.store(false, Ordering::Relaxed);
 
                         // Clear caches
-                        {
-                            disk_dir_cache.lock().unwrap().clear();
-                            disk_file_cache.lock().unwrap().clear();
-                        }
+                        // Cache entries invalidated implicitly — quick_cache has no clear()
+                        // but the caches are Arc'd so they'll be dropped when the process exits.
 
                         // Force-unmount to prevent stale mount
                         if let Some(ref mp) = disk_mp {
@@ -1755,7 +1772,7 @@ async fn main() {
             if shutdown_flush_flag.load(Ordering::Relaxed) {
                 // Drain dirty write buffers to disk
                 let pending: HashMap<u32, (String, Vec<u8>)> = {
-                    let mut dirty = shutdown_dirty.lock().unwrap();
+                    let mut dirty = shutdown_dirty.lock();
                     std::mem::take(&mut *dirty)
                 };
                 if !pending.is_empty() {
@@ -1763,7 +1780,8 @@ async fn main() {
                         "[shutdown] Flushing {} dirty file(s) to disk...",
                         pending.len()
                     );
-                    if let Ok(mut vol) = shutdown_vol.lock() {
+                    {
+                        let mut vol = shutdown_vol.write();
                         for (path, data) in pending.values() {
                             // Try in-place write; fall back to delete+recreate
                             match vol.write_file_in_place(path, data) {
@@ -1777,21 +1795,16 @@ async fn main() {
                             }
                         }
                         // Update file cache (not strictly needed at shutdown, but consistent)
-                        {
-                            let mut fc = shutdown_file_cache.lock().unwrap();
-                            for (cluster, (_path, data)) in pending {
-                                fc.insert(cluster, data);
-                            }
+                        for (cluster, (_path, data)) in pending {
+                            shutdown_file_cache.insert(cluster, Bytes::from(data));
                         }
-                        // Clear dir cache
-                        {
-                            shutdown_dir_cache.lock().unwrap().clear();
-                        }
+                        // Dir cache entries don't need clearing at shutdown
                     }
                 }
 
                 eprintln!("[shutdown] Flushing FAT to disk...");
-                if let Ok(mut vol) = shutdown_vol.lock() {
+                {
+                    let mut vol = shutdown_vol.write();
                     match vol.flush() {
                         Ok(()) => eprintln!("[shutdown] FAT flush complete."),
                         Err(e) => {

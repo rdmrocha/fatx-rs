@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # fatx-rs setup script for macOS
-# Installs Rust (if needed), builds all tools, and optionally installs them.
+# Installs Rust (if needed), runs tests, builds all tools, and optionally installs them.
 #
 
 set -e
@@ -10,7 +10,7 @@ BOLD='\033[1m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 RED='\033[0;31m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 echo ""
 echo -e "${BOLD}========================================${NC}"
@@ -21,7 +21,7 @@ echo ""
 # ---------------------------------------------------------------------------
 # Step 1: Check / install Rust
 # ---------------------------------------------------------------------------
-echo -e "${BOLD}[1/4] Checking for Rust toolchain...${NC}"
+echo -e "${BOLD}[1/5] Checking for Rust toolchain...${NC}"
 
 if command -v cargo &> /dev/null; then
     RUST_VER=$(rustc --version)
@@ -37,27 +37,42 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# Step 2: Build
+# Step 2: Run tests
 # ---------------------------------------------------------------------------
-echo -e "${BOLD}[2/4] Building all tools (release mode)...${NC}"
+echo -e "${BOLD}[2/5] Running test suite...${NC}"
 echo ""
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+if cargo test --workspace 2>&1 | tail -5; then
+    echo ""
+    echo -e "  ${GREEN}All tests passed${NC}"
+else
+    echo ""
+    echo -e "  ${RED}Some tests failed — build may still work but proceed with caution${NC}"
+fi
+echo ""
+
+# ---------------------------------------------------------------------------
+# Step 3: Build
+# ---------------------------------------------------------------------------
+echo -e "${BOLD}[3/5] Building all tools (release mode)...${NC}"
+echo ""
+
 cargo build --release 2>&1
 
 echo ""
 echo -e "  ${GREEN}Built successfully:${NC}"
-echo "    target/release/fatx         (main CLI)"
-echo "    target/release/fatx-mount   (NFS mount server)"
+echo "    target/release/fatx         (main CLI + interactive mode)"
+echo "    target/release/fatx-mount   (NFS mount server for Finder)"
 echo "    target/release/fatx-mkimage (test image generator)"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Step 3: Optional install to /usr/local/bin
+# Step 4: Optional install to /usr/local/bin
 # ---------------------------------------------------------------------------
-echo -e "${BOLD}[3/4] Install to /usr/local/bin? (makes 'fatx' available system-wide)${NC}"
+echo -e "${BOLD}[4/5] Install to /usr/local/bin? (makes 'fatx' available system-wide)${NC}"
 read -p "  Install? (y/n) [n]: " INSTALL_CHOICE
 
 BINARIES="fatx fatx-mount fatx-mkimage"
@@ -82,26 +97,34 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# Step 4: Quick help
+# Step 5: Quick help
 # ---------------------------------------------------------------------------
-echo -e "${BOLD}[4/4] Quick start${NC}"
+echo -e "${BOLD}[5/5] Quick start${NC}"
 echo ""
 echo "  Interactive mode (guided — prompts for everything):"
 echo -e "    ${GREEN}sudo fatx${NC}"
 echo ""
-echo "  Subcommands:"
-echo "    sudo fatx scan /dev/rdisk4"
-echo "    sudo fatx ls /dev/rdisk4 --partition \"Data (E)\" / -l"
-echo "    sudo fatx read /dev/rdisk4 --partition \"Data (E)\" /saves/game.sav -o game.sav"
-echo "    sudo fatx mount /dev/rdisk4 --partition \"360 Data\" -v --mount"
-echo "    fatx mkimage test.img --size 1G --populate"
+echo "  Common commands:"
+echo "    sudo fatx scan /dev/rdiskN                              # find Xbox partitions"
+echo "    sudo fatx ls /dev/rdiskN --partition \"360 Data\" /       # list root directory"
+echo "    sudo fatx info /dev/rdiskN --partition \"360 Data\"       # volume stats"
+echo "    sudo fatx mount /dev/rdiskN --partition \"360 Data\" --mount  # mount in Finder"
+echo "    sudo fatx browse /dev/rdiskN --partition \"360 Data\"     # TUI file browser"
+echo "    fatx mkimage test.img --size 1G --populate              # create test image"
 echo ""
-echo "  For full help:"
-echo "    fatx --help"
+echo "  File operations:"
+echo "    sudo fatx read /dev/rdiskN --partition \"360 Data\" /path/to/file"
+echo "    sudo fatx write /dev/rdiskN --partition \"360 Data\" /dest -i local_file"
+echo "    sudo fatx mkdir /dev/rdiskN --partition \"360 Data\" /NewDir"
+echo "    sudo fatx rm /dev/rdiskN --partition \"360 Data\" /file.txt"
+echo "    sudo fatx rename /dev/rdiskN --partition \"360 Data\" /old.txt new.txt"
+echo "    sudo fatx rmr /dev/rdiskN --partition \"360 Data\" /Directory"
 echo ""
-echo -e "${BOLD}Important notes:${NC}"
-echo "  - Use /dev/rdiskN (raw device) for best performance"
-echo "  - Unmount the disk first: diskutil unmountDisk /dev/diskN"
-echo "  - sudo is required for raw device access and mounting"
+echo "  Tips:"
+echo "    - Use /dev/rdiskN (raw device) — not /dev/diskN"
+echo "    - Find your device: diskutil list | grep external"
+echo "    - Unmount macOS first: diskutil unmountDisk /dev/diskN"
+echo "    - sudo is required for raw device access and mounting"
+echo "    - Add --json to any command for machine-readable output"
 echo ""
 echo -e "${GREEN}Setup complete!${NC}"

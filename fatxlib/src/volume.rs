@@ -8,6 +8,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use log::{info, warn};
 
 use crate::error::{FatxError, Result};
+use crate::platform::DeviceInfo;
 use crate::types::*;
 
 /// A mounted FATX volume backed by a seekable stream.
@@ -38,6 +39,23 @@ pub struct FatxVolume<T: Read + Write + Seek> {
     fat_cache: Vec<u8>,
     /// Whether the FAT cache has been modified and needs to be flushed.
     fat_dirty: bool,
+    /// Device I/O parameters (None for non-device backends like Cursor).
+    device_info: Option<DeviceInfo>,
+    /// I/O alignment in bytes. 512 for standard devices/files, 4096 when F_NOCACHE is active.
+    alignment: u64,
+    /// Last allocated cluster (next-fit hint). Allocation starts scanning from here.
+    prev_free: u32,
+    /// Cached count of free clusters (maintained incrementally).
+    free_cluster_count: u32,
+    /// Cached count of bad clusters (computed once at open, doesn't change).
+    bad_cluster_count: u32,
+    /// Byte ranges within fat_cache that have been modified since last flush.
+    /// Each entry is (start_byte_offset, end_byte_offset) within fat_cache.
+    dirty_ranges: Vec<(usize, usize)>,
+    /// Free-cluster bitmap: 1 bit per cluster, set = free. Enables O(1) allocation
+    /// via word-level scanning with trailing_zeros(). For a 500GB partition with
+    /// 16KB clusters (~30M clusters), this is ~3.6MB vs scanning 120MB of FAT entries.
+    free_bitmap: Vec<u64>,
 }
 
 impl<T: Read + Write + Seek> FatxVolume<T> {
@@ -197,6 +215,79 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             fat_cache.len() as f64 / 1_048_576.0
         );
 
+        // Compute initial free/bad cluster counts and build the free-cluster bitmap.
+        // This is done once at open time; counts and bitmap are maintained incrementally.
+        let entry_size = fat_type.entry_size() as usize;
+        let mut free_cluster_count = 0u32;
+        let mut bad_cluster_count = 0u32;
+        // Bitmap: 1 bit per cluster, set = free. Need words for clusters 0..total_clusters+FIRST_CLUSTER.
+        let bitmap_words = ((FIRST_CLUSTER + total_clusters) as usize).div_ceil(64);
+        let mut free_bitmap = vec![0u64; bitmap_words];
+
+        for cluster in FIRST_CLUSTER..(FIRST_CLUSTER + total_clusters) {
+            let cache_offset = cluster as usize * entry_size;
+            let is_free = match fat_type {
+                FatType::Fat16 => {
+                    let val = if is_xtaf {
+                        u16::from_be_bytes([fat_cache[cache_offset], fat_cache[cache_offset + 1]])
+                    } else {
+                        u16::from_le_bytes([fat_cache[cache_offset], fat_cache[cache_offset + 1]])
+                    };
+                    if val == FAT16_FREE {
+                        Some(true)
+                    } else if val == FAT16_BAD {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                FatType::Fat32 => {
+                    let val = if is_xtaf {
+                        u32::from_be_bytes([
+                            fat_cache[cache_offset],
+                            fat_cache[cache_offset + 1],
+                            fat_cache[cache_offset + 2],
+                            fat_cache[cache_offset + 3],
+                        ])
+                    } else {
+                        u32::from_le_bytes([
+                            fat_cache[cache_offset],
+                            fat_cache[cache_offset + 1],
+                            fat_cache[cache_offset + 2],
+                            fat_cache[cache_offset + 3],
+                        ])
+                    };
+                    if val == FAT32_FREE {
+                        Some(true)
+                    } else if val == FAT32_BAD {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+            };
+            match is_free {
+                Some(true) => {
+                    free_cluster_count += 1;
+                    // Set bit in bitmap: cluster N -> word N/64, bit N%64
+                    let word = cluster as usize / 64;
+                    let bit = cluster as usize % 64;
+                    free_bitmap[word] |= 1u64 << bit;
+                }
+                Some(false) => bad_cluster_count += 1,
+                None => {} // used cluster
+            }
+        }
+        info!(
+            "Cluster counts: {} free, {} bad, {} used (of {} total), bitmap {} words ({:.1} KB)",
+            free_cluster_count,
+            bad_cluster_count,
+            total_clusters - free_cluster_count - bad_cluster_count,
+            total_clusters,
+            free_bitmap.len(),
+            free_bitmap.len() as f64 * 8.0 / 1024.0,
+        );
+
         Ok(FatxVolume {
             inner,
             partition_offset,
@@ -210,7 +301,49 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             big_endian: is_xtaf,
             fat_cache,
             fat_dirty: false,
+            device_info: None,
+            alignment: SECTOR_SIZE,
+            prev_free: FIRST_CLUSTER,
+            free_cluster_count,
+            bad_cluster_count,
+            dirty_ranges: Vec::new(),
+            free_bitmap,
         })
+    }
+
+    /// Configure device I/O parameters for a raw block device.
+    ///
+    /// Call this after `open()` when the underlying stream is a raw device
+    /// (e.g., `/dev/rdiskN`). Sets F_NOCACHE, F_RDAHEAD(0), and queries
+    /// device-specific I/O parameters.
+    ///
+    /// Does nothing if `configure_device_io` returns None (not a block device).
+    #[cfg(target_os = "macos")]
+    pub fn configure_device(&mut self, fd: std::os::unix::io::RawFd) {
+        if let Some(info) = crate::platform::configure_device_io(fd) {
+            // With F_NOCACHE active, I/O must be page-aligned (4096 bytes).
+            // Use the maximum of sector size, physical block size, and page size.
+            let page_size = 4096u64;
+            self.alignment = SECTOR_SIZE
+                .max(info.physical_block_size as u64)
+                .max(page_size);
+            info!(
+                "I/O alignment set to {} bytes (physical_block_size={}, F_NOCACHE requires {})",
+                self.alignment, info.physical_block_size, page_size
+            );
+            self.device_info = Some(info);
+        }
+    }
+
+    /// Stub for non-macOS platforms.
+    #[cfg(not(target_os = "macos"))]
+    pub fn configure_device(&mut self, _fd: i32) {
+        // No-op on non-macOS
+    }
+
+    /// Get the device info, if available.
+    pub fn device_info(&self) -> Option<&DeviceInfo> {
+        self.device_info.as_ref()
     }
 
     // -----------------------------------------------------------------------
@@ -258,15 +391,51 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         self.partition_offset + partition_rel
     }
 
+    /// Merge overlapping/adjacent dirty ranges into consolidated spans.
+    fn merge_dirty_ranges(&self) -> Vec<(usize, usize)> {
+        if self.dirty_ranges.is_empty() {
+            return Vec::new();
+        }
+        let mut sorted = self.dirty_ranges.clone();
+        sorted.sort_by_key(|r| r.0);
+
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        let (mut cur_start, mut cur_end) = sorted[0];
+
+        for &(start, end) in &sorted[1..] {
+            if start <= cur_end {
+                // Overlapping or adjacent — extend
+                cur_end = cur_end.max(end);
+            } else {
+                merged.push((cur_start, cur_end));
+                cur_start = start;
+                cur_end = end;
+            }
+        }
+        merged.push((cur_start, cur_end));
+        merged
+    }
+
+    /// Align `offset` down to `self.alignment` boundary.
+    fn align_down(&self, offset: u64) -> u64 {
+        let mask = self.alignment - 1;
+        offset & !mask
+    }
+
+    /// Round `size` up to next `self.alignment` boundary.
+    fn align_up(&self, size: usize) -> usize {
+        let mask = self.alignment as usize - 1;
+        (size + mask) & !mask
+    }
+
     /// Read `buf.len()` bytes from a partition-relative offset.
-    /// Handles sector alignment automatically for raw devices.
+    /// Handles alignment automatically for raw devices (512B default, 4KB with F_NOCACHE).
     fn read_at(&mut self, partition_rel: u64, buf: &mut [u8]) -> Result<()> {
         let abs = self.abs_offset(partition_rel);
-        // Align to 512-byte sector boundary
-        let aligned_start = abs & !0x1FF;
+        let aligned_start = self.align_down(abs);
         let pre_skip = (abs - aligned_start) as usize;
         let total_needed = pre_skip + buf.len();
-        let aligned_len = (total_needed + 511) & !511; // round up to sector
+        let aligned_len = self.align_up(total_needed);
 
         self.inner.seek(SeekFrom::Start(aligned_start))?;
         let mut aligned_buf = vec![0u8; aligned_len];
@@ -276,15 +445,16 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
     }
 
     /// Write `buf` at a partition-relative offset.
-    /// For raw devices, does a read-modify-write if the write isn't sector-aligned.
+    /// For raw devices, does a read-modify-write if the write isn't aligned.
     fn write_at(&mut self, partition_rel: u64, buf: &[u8]) -> Result<()> {
         let abs = self.abs_offset(partition_rel);
-        let aligned_start = abs & !0x1FF;
+        let aligned_start = self.align_down(abs);
         let pre_skip = (abs - aligned_start) as usize;
         let total_needed = pre_skip + buf.len();
-        let aligned_len = (total_needed + 511) & !511;
+        let aligned_len = self.align_up(total_needed);
+        let align = self.alignment as usize;
 
-        if pre_skip == 0 && buf.len().is_multiple_of(512) {
+        if pre_skip == 0 && buf.len().is_multiple_of(align) {
             // Already aligned — write directly
             self.inner.seek(SeekFrom::Start(abs))?;
             self.inner.write_all(buf)?;
@@ -316,7 +486,8 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
     // -----------------------------------------------------------------------
 
     /// Read a single FAT entry for the given cluster.
-    pub fn read_fat_entry(&mut self, cluster: u32) -> Result<FatEntry> {
+    /// Takes `&self` — only reads from the in-memory fat_cache, no device I/O.
+    pub fn read_fat_entry(&self, cluster: u32) -> Result<FatEntry> {
         let cache_offset = (cluster as u64 * self.fat_type.entry_size()) as usize;
 
         match self.fat_type {
@@ -353,7 +524,13 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
     /// Write a FAT entry for the given cluster (updates in-memory cache).
     /// Changes are flushed to disk when `flush()` is called.
+    /// Maintains `free_cluster_count` incrementally on state transitions.
     pub fn write_fat_entry(&mut self, cluster: u32, entry: FatEntry) -> Result<()> {
+        // Read old entry to detect state transitions for free count maintenance
+        let old_entry = self.read_fat_entry(cluster)?;
+        let was_free = matches!(old_entry, FatEntry::Free);
+        let will_be_free = matches!(entry, FatEntry::Free);
+
         let cache_offset = (cluster as u64 * self.fat_type.entry_size()) as usize;
 
         match self.fat_type {
@@ -382,13 +559,31 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                 self.fat_cache[cache_offset + 3] = bytes[3];
             }
         }
+
+        // Maintain free cluster count and bitmap
+        let word = cluster as usize / 64;
+        let bit = cluster as usize % 64;
+        if was_free && !will_be_free {
+            self.free_cluster_count = self.free_cluster_count.saturating_sub(1);
+            self.free_bitmap[word] &= !(1u64 << bit); // clear bit
+        } else if !was_free && will_be_free {
+            self.free_cluster_count += 1;
+            self.free_bitmap[word] |= 1u64 << bit; // set bit
+        }
+
+        // Record dirty range for partial flush
+        let entry_size = self.fat_type.entry_size() as usize;
+        self.dirty_ranges
+            .push((cache_offset, cache_offset + entry_size));
+
         self.fat_dirty = true;
         Ok(())
     }
 
     /// Follow the cluster chain starting from `start_cluster` and return
     /// the list of clusters in order.
-    pub fn read_chain(&mut self, start_cluster: u32) -> Result<Vec<u32>> {
+    /// Takes `&self` — only reads from the in-memory fat_cache, no device I/O.
+    pub fn read_chain(&self, start_cluster: u32) -> Result<Vec<u32>> {
         let mut chain = Vec::new();
         let mut current = start_cluster;
         let max_iters = self.total_clusters as usize + 1; // safety bound
@@ -412,29 +607,115 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         Ok(chain)
     }
 
-    /// Find a free cluster and mark it as end-of-chain. Returns the cluster index.
+    /// Find a free cluster via bitmap scan and mark it as end-of-chain.
+    /// Uses next-fit: starts scanning from `prev_free + 1`, wraps around if needed.
+    /// Scans the free_bitmap (1 bit/cluster) which is 32x faster than FAT entries.
     pub fn allocate_cluster(&mut self) -> Result<u32> {
-        for cluster in FIRST_CLUSTER..(FIRST_CLUSTER + self.total_clusters) {
-            if let FatEntry::Free = self.read_fat_entry(cluster)? {
+        if self.free_cluster_count == 0 {
+            return Err(FatxError::DiskFull);
+        }
+
+        let end = FIRST_CLUSTER + self.total_clusters;
+        let start_from = if self.prev_free + 1 >= end {
+            FIRST_CLUSTER
+        } else {
+            self.prev_free + 1
+        };
+
+        if let Some(cluster) = self.bitmap_find_free(start_from, end) {
+            self.write_fat_entry(cluster, FatEntry::EndOfChain)?;
+            self.prev_free = cluster;
+            return Ok(cluster);
+        }
+
+        // Wraparound
+        if start_from > FIRST_CLUSTER {
+            if let Some(cluster) = self.bitmap_find_free(FIRST_CLUSTER, start_from) {
                 self.write_fat_entry(cluster, FatEntry::EndOfChain)?;
+                self.prev_free = cluster;
                 return Ok(cluster);
             }
         }
+
         Err(FatxError::DiskFull)
     }
 
+    /// Find the first free cluster in the bitmap between `from` (inclusive) and `to` (exclusive).
+    fn bitmap_find_free(&self, from: u32, to: u32) -> Option<u32> {
+        let from = from as usize;
+        let to = to as usize;
+        let start_word = from / 64;
+        let end_word = to.div_ceil(64);
+
+        for word_idx in start_word..end_word.min(self.free_bitmap.len()) {
+            let mut word = self.free_bitmap[word_idx];
+            if word == 0 {
+                continue;
+            }
+
+            // Mask out bits before `from` in the starting word
+            if word_idx == start_word {
+                let start_bit = from % 64;
+                word &= !((1u64 << start_bit) - 1);
+                if word == 0 {
+                    continue;
+                }
+            }
+
+            // Find first set bit
+            let bit = word.trailing_zeros() as usize;
+            let cluster = word_idx * 64 + bit;
+
+            if cluster >= to {
+                return None;
+            }
+            return Some(cluster as u32);
+        }
+        None
+    }
+
     /// Allocate `count` clusters and chain them together. Returns the first cluster.
+    /// Uses bitmap scanning from `prev_free + 1`, wraps around if needed.
     pub fn allocate_chain(&mut self, count: usize) -> Result<u32> {
         if count == 0 {
             return Err(FatxError::DiskFull);
         }
 
+        if (self.free_cluster_count as usize) < count {
+            return Err(FatxError::DiskFull);
+        }
+
+        let end = FIRST_CLUSTER + self.total_clusters;
+        let start_from = if self.prev_free + 1 >= end {
+            FIRST_CLUSTER
+        } else {
+            self.prev_free + 1
+        };
+
         let mut allocated = Vec::with_capacity(count);
-        for cluster in FIRST_CLUSTER..(FIRST_CLUSTER + self.total_clusters) {
-            if let FatEntry::Free = self.read_fat_entry(cluster)? {
-                allocated.push(cluster);
-                if allocated.len() == count {
-                    break;
+        let mut cursor = start_from;
+
+        // Pass 1: from prev_free+1 to end
+        while allocated.len() < count {
+            match self.bitmap_find_free(cursor, end) {
+                Some(cluster) => {
+                    allocated.push(cluster);
+                    cursor = cluster + 1;
+                }
+                None => break,
+            }
+        }
+
+        // Pass 2: wraparound from beginning
+        if allocated.len() < count && start_from > FIRST_CLUSTER {
+            cursor = FIRST_CLUSTER;
+            while allocated.len() < count {
+                match self.bitmap_find_free(cursor, start_from) {
+                    Some(cluster) => {
+                        allocated.push(cluster);
+                        cursor = cluster + 1;
+                    }
+                    None => break,
                 }
             }
         }
@@ -448,6 +729,9 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             self.write_fat_entry(allocated[i], FatEntry::Next(allocated[i + 1]))?;
         }
         self.write_fat_entry(*allocated.last().unwrap(), FatEntry::EndOfChain)?;
+
+        // Update prev_free to the last allocated cluster
+        self.prev_free = *allocated.last().unwrap();
 
         Ok(allocated[0])
     }
@@ -828,17 +1112,9 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         }
 
         // Create directory entry — use UTC so Xbox displays correct local time
-        let now = chrono::Utc::now();
-        let date = DirectoryEntry::encode_date(
-            now.format("%Y").to_string().parse().unwrap_or(2025),
-            now.format("%m").to_string().parse().unwrap_or(1),
-            now.format("%d").to_string().parse().unwrap_or(1),
-        );
-        let time = DirectoryEntry::encode_time(
-            now.format("%H").to_string().parse().unwrap_or(0),
-            now.format("%M").to_string().parse().unwrap_or(0),
-            now.format("%S").to_string().parse().unwrap_or(0),
-        );
+        let now = time::OffsetDateTime::now_utc();
+        let date = DirectoryEntry::encode_date(now.year() as u16, now.month() as u8, now.day());
+        let time = DirectoryEntry::encode_time(now.hour(), now.minute(), now.second());
 
         let mut filename_raw = [0xFFu8; MAX_FILENAME_LEN];
         let name_bytes = filename.as_bytes();
@@ -892,17 +1168,9 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         self.write_cluster(cluster, &blank)?;
 
         // Use UTC so Xbox displays correct local time
-        let now = chrono::Utc::now();
-        let date = DirectoryEntry::encode_date(
-            now.format("%Y").to_string().parse().unwrap_or(2025),
-            now.format("%m").to_string().parse().unwrap_or(1),
-            now.format("%d").to_string().parse().unwrap_or(1),
-        );
-        let time = DirectoryEntry::encode_time(
-            now.format("%H").to_string().parse().unwrap_or(0),
-            now.format("%M").to_string().parse().unwrap_or(0),
-            now.format("%S").to_string().parse().unwrap_or(0),
-        );
+        let now = time::OffsetDateTime::now_utc();
+        let date = DirectoryEntry::encode_date(now.year() as u16, now.month() as u8, now.day());
+        let time = DirectoryEntry::encode_time(now.hour(), now.minute(), now.second());
 
         let mut filename_raw = [0xFFu8; MAX_FILENAME_LEN];
         let name_bytes = dirname.as_bytes();
@@ -965,18 +1233,45 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             // Find the last cluster in the existing chain
             let last_old = *old_chain.last().unwrap();
 
-            // Allocate additional clusters
+            // Allocate additional clusters using bitmap scan from prev_free
             let mut new_clusters = Vec::with_capacity(extra);
-            for cluster in FIRST_CLUSTER..(FIRST_CLUSTER + self.total_clusters) {
-                if let FatEntry::Free = self.read_fat_entry(cluster)? {
-                    new_clusters.push(cluster);
-                    if new_clusters.len() == extra {
-                        break;
+            let end = FIRST_CLUSTER + self.total_clusters;
+            let start_from = if self.prev_free + 1 >= end {
+                FIRST_CLUSTER
+            } else {
+                self.prev_free + 1
+            };
+            let mut cursor = start_from;
+
+            // Pass 1: from prev_free+1 to end
+            while new_clusters.len() < extra {
+                match self.bitmap_find_free(cursor, end) {
+                    Some(cluster) => {
+                        new_clusters.push(cluster);
+                        cursor = cluster + 1;
+                    }
+                    None => break,
+                }
+            }
+            // Pass 2: wraparound
+            if new_clusters.len() < extra && start_from > FIRST_CLUSTER {
+                cursor = FIRST_CLUSTER;
+                while new_clusters.len() < extra {
+                    match self.bitmap_find_free(cursor, start_from) {
+                        Some(cluster) => {
+                            new_clusters.push(cluster);
+                            cursor = cluster + 1;
+                        }
+                        None => break,
                     }
                 }
             }
             if new_clusters.len() < extra {
                 return Err(FatxError::DiskFull);
+            }
+            // Update prev_free
+            if let Some(&last) = new_clusters.last() {
+                self.prev_free = last;
             }
 
             // Link: old_last -> new_clusters[0] -> ... -> EOC
@@ -1023,6 +1318,101 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             old_count
         );
         Ok(())
+    }
+
+    /// Prepare a file for in-place writing: extend or shrink the cluster chain
+    /// as needed and update the directory entry size. Returns the cluster chain
+    /// that the caller should write data to (one cluster at a time).
+    ///
+    /// This separates the fast FAT operations (chain management) from the slow
+    /// data writing (USB I/O), allowing callers to release locks between cluster
+    /// writes to avoid blocking other operations.
+    ///
+    /// After calling this, write data to each cluster in the returned chain using
+    /// `write_cluster()`, then call `flush()` to persist FAT changes.
+    pub fn prepare_write_in_place(&mut self, path: &str, new_size: usize) -> Result<Vec<u32>> {
+        let (parent_path, filename) = split_path(path);
+        let parent = self.resolve_path(parent_path)?;
+        let target = self.resolve_path(path)?;
+
+        if target.is_directory() {
+            return Err(FatxError::IsADirectory(path.to_string()));
+        }
+
+        let cluster_size = self.superblock.cluster_size() as usize;
+        let clusters_needed = if new_size == 0 {
+            1
+        } else {
+            new_size.div_ceil(cluster_size)
+        };
+
+        let old_chain = self.read_chain(target.first_cluster)?;
+        let old_count = old_chain.len();
+
+        // Extend chain if file grew
+        if clusters_needed > old_count {
+            let extra = clusters_needed - old_count;
+            let last_old = *old_chain.last().unwrap();
+
+            let end = FIRST_CLUSTER + self.total_clusters;
+            let start_from = if self.prev_free + 1 >= end {
+                FIRST_CLUSTER
+            } else {
+                self.prev_free + 1
+            };
+            let mut new_clusters = Vec::with_capacity(extra);
+            let mut cursor = start_from;
+
+            while new_clusters.len() < extra {
+                match self.bitmap_find_free(cursor, end) {
+                    Some(c) => {
+                        new_clusters.push(c);
+                        cursor = c + 1;
+                    }
+                    None => break,
+                }
+            }
+            if new_clusters.len() < extra && start_from > FIRST_CLUSTER {
+                cursor = FIRST_CLUSTER;
+                while new_clusters.len() < extra {
+                    match self.bitmap_find_free(cursor, start_from) {
+                        Some(c) => {
+                            new_clusters.push(c);
+                            cursor = c + 1;
+                        }
+                        None => break,
+                    }
+                }
+            }
+            if new_clusters.len() < extra {
+                return Err(FatxError::DiskFull);
+            }
+            if let Some(&last) = new_clusters.last() {
+                self.prev_free = last;
+            }
+
+            self.write_fat_entry(last_old, FatEntry::Next(new_clusters[0]))?;
+            for i in 0..new_clusters.len() - 1 {
+                self.write_fat_entry(new_clusters[i], FatEntry::Next(new_clusters[i + 1]))?;
+            }
+            self.write_fat_entry(*new_clusters.last().unwrap(), FatEntry::EndOfChain)?;
+        }
+
+        // Get the full chain (may have been extended)
+        let chain = self.read_chain(target.first_cluster)?;
+
+        // Free excess clusters if file shrank
+        if clusters_needed < old_count {
+            self.write_fat_entry(chain[clusters_needed - 1], FatEntry::EndOfChain)?;
+            for &cluster in chain.iter().take(old_count).skip(clusters_needed) {
+                self.write_fat_entry(cluster, FatEntry::Free)?;
+            }
+        }
+
+        // Update directory entry file_size
+        self.update_dirent_size(parent.first_cluster, filename, new_size as u32)?;
+
+        Ok(chain.into_iter().take(clusters_needed).collect())
     }
 
     /// Update the file_size field of a directory entry on disk.
@@ -1254,57 +1644,76 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
     /// Flush any buffered writes to the underlying device.
     pub fn flush(&mut self) -> Result<()> {
-        if self.fat_dirty {
-            // Write the entire FAT cache back to disk in one shot.
-            // Sector-align the write for raw device compatibility.
+        if self.fat_dirty && !self.dirty_ranges.is_empty() {
+            // Merge overlapping/adjacent dirty ranges and align to I/O boundaries.
+            let merged = self.merge_dirty_ranges();
             let fat_abs = self.partition_offset + self.fat_offset;
-            let aligned_start = fat_abs & !0x1FF;
-            let pre_skip = (fat_abs - aligned_start) as usize;
 
-            if pre_skip == 0 && self.fat_cache.len().is_multiple_of(512) {
-                // FAT is already sector-aligned — write directly
-                self.inner.seek(SeekFrom::Start(fat_abs))?;
-                self.inner.write_all(&self.fat_cache)?;
-            } else {
-                // Need read-modify-write at boundaries
-                let total = pre_skip + self.fat_cache.len();
-                let aligned_len = (total + 511) & !511;
+            let mut flushed_bytes = 0usize;
+            let mut failed = false;
+
+            for (start, end) in &merged {
+                let range_abs = fat_abs + *start as u64;
+                let aligned_start = self.align_down(range_abs);
+                let pre_skip = (range_abs - aligned_start) as usize;
+                let range_len = end - start;
+                let total = pre_skip + range_len;
+                let aligned_len = self.align_up(total);
+
+                // Read-modify-write for this aligned region
+                self.inner.seek(SeekFrom::Start(aligned_start))?;
                 let mut buf = vec![0u8; aligned_len];
+                if let Err(e) = self.inner.read_exact(&mut buf) {
+                    warn!(
+                        "Dirty-range flush read failed at offset 0x{:X}: {}",
+                        aligned_start, e
+                    );
+                    failed = true;
+                    break;
+                }
 
-                // Read existing aligned data
+                buf[pre_skip..pre_skip + range_len].copy_from_slice(&self.fat_cache[*start..*end]);
+
                 self.inner.seek(SeekFrom::Start(aligned_start))?;
-                self.inner.read_exact(&mut buf)?;
+                if let Err(e) = self.inner.write_all(&buf) {
+                    warn!(
+                        "Dirty-range flush write failed at offset 0x{:X}: {}",
+                        aligned_start, e
+                    );
+                    failed = true;
+                    break;
+                }
 
-                // Overlay our FAT cache
-                buf[pre_skip..pre_skip + self.fat_cache.len()].copy_from_slice(&self.fat_cache);
-
-                // Write back
-                self.inner.seek(SeekFrom::Start(aligned_start))?;
-                self.inner.write_all(&buf)?;
+                flushed_bytes += aligned_len;
             }
 
-            self.fat_dirty = false;
-            info!("Flushed FAT cache to disk ({} bytes)", self.fat_cache.len());
+            if failed {
+                // Remove successfully flushed ranges, keep remaining for retry.
+                // (On failure, we break out of the loop — remaining ranges stay.)
+                warn!("Partial FAT flush — some ranges may need retry");
+            } else {
+                self.dirty_ranges.clear();
+                self.fat_dirty = false;
+            }
+
+            info!(
+                "Flushed FAT: {} dirty ranges, {} bytes written (of {} total FAT)",
+                merged.len(),
+                flushed_bytes,
+                self.fat_cache.len()
+            );
         }
         self.inner.flush()?;
         Ok(())
     }
 
-    /// Get volume statistics.
-    pub fn stats(&mut self) -> Result<VolumeStats> {
-        let mut free_clusters = 0u32;
-        let mut used_clusters = 0u32;
-        let mut bad_clusters = 0u32;
-
-        for cluster in FIRST_CLUSTER..(FIRST_CLUSTER + self.total_clusters) {
-            match self.read_fat_entry(cluster)? {
-                FatEntry::Free => free_clusters += 1,
-                FatEntry::Bad => bad_clusters += 1,
-                _ => used_clusters += 1,
-            }
-        }
-
+    /// Get volume statistics. O(1) — uses cached counts maintained incrementally.
+    pub fn stats(&self) -> Result<VolumeStats> {
+        let free_clusters = self.free_cluster_count;
+        let bad_clusters = self.bad_cluster_count;
+        let used_clusters = self.total_clusters - free_clusters - bad_clusters;
         let cluster_size = self.superblock.cluster_size();
+
         Ok(VolumeStats {
             total_clusters: self.total_clusters,
             free_clusters,

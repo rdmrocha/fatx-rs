@@ -89,7 +89,7 @@ Test locations:
 - CLI bugs → `tests/cli_integration.rs`
 
 ### Agent (Claude ↔ Drive Bridge)
-A file-based RPC agent (`/.agent/agent.sh`) runs on the Mac with sudo, watching for `request.json`, executing `fatx --json`, and writing `response.json`. The sandbox helper is at `/sessions/zealous-busy-pascal/fatx-cmd.sh`. Agent state files are gitignored. When using shell scripts via the agent (placed in `.tmp/`), delete them after use to keep the directory clean.
+A file-based RPC agent (`/.agent/agent.sh`) runs on the Mac with sudo, watching for `request.json`, executing `fatx --json`, and writing `response.json`. The sandbox helper is at `/sessions/zealous-busy-pascal/fatx-cmd.sh`. Agent state files are gitignored. When using shell scripts via the agent (placed in `.tmp/`), delete them after use to keep the directory clean. **All LLM-generated temporary files MUST go in `.tmp/`** — see `.claude/rules/file-hygiene.md`.
 
 ### Test drive
 - 1TB Xbox 360 formatted drive at `/dev/rdisk4` (may change between sessions — verify with `diskutil list`)

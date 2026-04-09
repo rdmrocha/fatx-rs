@@ -487,6 +487,13 @@ fn interactive_mode() {
         }
     };
 
+    // Capture raw fd before file is moved into the volume
+    #[cfg(target_os = "macos")]
+    let raw_fd = {
+        use std::os::unix::io::AsRawFd;
+        file.as_raw_fd()
+    };
+
     let mut vol = match FatxVolume::open(file, part_offset, part_size) {
         Ok(v) => v,
         Err(e) => {
@@ -494,6 +501,10 @@ fn interactive_mode() {
             return;
         }
     };
+
+    // Configure macOS-specific I/O (F_NOCACHE, F_RDAHEAD, device params)
+    #[cfg(target_os = "macos")]
+    vol.configure_device(raw_fd);
 
     println!(
         "Volume opened: {} ({}, {}, {})",
@@ -1235,7 +1246,14 @@ fn open_volume(
         size
     };
 
-    FatxVolume::open(file, offset, size).unwrap_or_else(|e| {
+    // Capture raw fd before file is moved into the volume
+    #[cfg(target_os = "macos")]
+    let raw_fd = {
+        use std::os::unix::io::AsRawFd;
+        file.as_raw_fd()
+    };
+
+    let mut vol = FatxVolume::open(file, offset, size).unwrap_or_else(|e| {
         eprintln!("Error opening FATX volume: {}", e);
 
         // If no partition was specified, scan and show available partitions
@@ -1278,7 +1296,13 @@ fn open_volume(
             }
         }
         process::exit(1);
-    })
+    });
+
+    // Configure macOS-specific I/O (F_NOCACHE, F_RDAHEAD, device params)
+    #[cfg(target_os = "macos")]
+    vol.configure_device(raw_fd);
+
+    vol
 }
 
 fn dirent_to_json(entry: &fatxlib::types::DirectoryEntry) -> JsonDirEntry {
@@ -1857,7 +1881,7 @@ fn main() {
             size,
             partition,
         }) => {
-            let mut vol = open_volume(&device, &partition, offset, size);
+            let vol = open_volume(&device, &partition, offset, size);
             if json {
                 let stats = vol.stats().unwrap_or_else(|e| {
                     println!("{}", serde_json::json!({"error": format!("{}", e)}));
