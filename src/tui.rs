@@ -371,6 +371,8 @@ fn io_worker(
                 let mut files_done = 0usize;
                 let mut cancelled = false;
 
+                let cluster_size = vol.superblock.cluster_size() as usize;
+
                 for (local_file, fatx_path) in &file_list {
                     if cancel_flag.load(Ordering::Relaxed) {
                         cancelled = true;
@@ -380,36 +382,116 @@ fn io_worker(
                     let file_size = fs::metadata(local_file).map(|m| m.len()).unwrap_or(0);
                     files_done += 1;
 
+                    // Short filename for display
+                    let short_name = local_file
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| fatx_path.clone());
+
                     let _ = resp_tx.send(IoResp::Progress {
                         message: format!(
-                            "Uploading [{}/{}] {} ({}/{})",
+                            "[{}/{}] {} ({}) — {}/{}",
                             files_done,
                             total_files,
-                            fatx_path,
+                            short_name,
+                            format_size(file_size),
                             format_size(bytes_done),
                             format_size(total_size),
                         ),
                     });
 
-                    match fs::read(local_file) {
-                        Ok(data) => match vol.create_file(fatx_path, &data) {
-                            Ok(_) => {
-                                bytes_done += file_size;
-                            }
-                            Err(e) => {
-                                let _ = vol.flush();
-                                let _ = resp_tx.send(IoResp::Error {
-                                    message: format!("{}: {}", fatx_path, e),
-                                });
-                                // Continue to next file instead of aborting entirely
-                                continue;
-                            }
-                        },
+                    let data = match fs::read(local_file) {
+                        Ok(d) => d,
                         Err(e) => {
                             let _ = resp_tx.send(IoResp::Error {
                                 message: format!("Read {}: {}", local_file.display(), e),
                             });
                             continue;
+                        }
+                    };
+
+                    // For large files (>1MB): chunked write with per-cluster progress
+                    if data.len() > 1_048_576 {
+                        // Create the file first (allocates clusters)
+                        if vol.create_file(fatx_path, &[]).is_err() {
+                            // If empty create fails, try directly with data
+                            if let Err(e2) = vol.create_file(fatx_path, &data) {
+                                let _ = resp_tx.send(IoResp::Error {
+                                    message: format!("{}: {}", fatx_path, e2),
+                                });
+                                continue;
+                            }
+                            bytes_done += file_size;
+                            continue;
+                        }
+                        // Now write in place with progress
+                        match vol.prepare_write_in_place(fatx_path, data.len()) {
+                            Ok(chain) => {
+                                let mut offset = 0usize;
+                                let mut file_bytes_written: u64;
+                                for &cluster in &chain {
+                                    if cancel_flag.load(Ordering::Relaxed) {
+                                        cancelled = true;
+                                        break;
+                                    }
+                                    let end = (offset + cluster_size).min(data.len());
+                                    let mut cluster_buf = vec![0u8; cluster_size];
+                                    if offset < data.len() {
+                                        let len = end - offset;
+                                        cluster_buf[..len].copy_from_slice(&data[offset..end]);
+                                    }
+                                    if let Err(e) = vol.write_cluster(cluster, &cluster_buf) {
+                                        let _ = resp_tx.send(IoResp::Error {
+                                            message: format!("Write cluster {}: {}", cluster, e),
+                                        });
+                                        break;
+                                    }
+                                    offset += cluster_size;
+                                    file_bytes_written = offset.min(data.len()) as u64;
+
+                                    // Send progress every ~1MB
+                                    if offset % (1024 * 1024) < cluster_size {
+                                        let _ = resp_tx.send(IoResp::Progress {
+                                            message: format!(
+                                                "[{}/{}] {} ({}/{}) — {}/{}",
+                                                files_done,
+                                                total_files,
+                                                short_name,
+                                                format_size(file_bytes_written),
+                                                format_size(file_size),
+                                                format_size(bytes_done + file_bytes_written),
+                                                format_size(total_size),
+                                            ),
+                                        });
+                                    }
+                                    if offset >= data.len() {
+                                        break;
+                                    }
+                                }
+                                if cancelled {
+                                    break;
+                                }
+                                bytes_done += file_size;
+                            }
+                            Err(e) => {
+                                let _ = resp_tx.send(IoResp::Error {
+                                    message: format!("{}: {}", fatx_path, e),
+                                });
+                                continue;
+                            }
+                        }
+                    } else {
+                        // Small files: atomic create
+                        match vol.create_file(fatx_path, &data) {
+                            Ok(_) => {
+                                bytes_done += file_size;
+                            }
+                            Err(e) => {
+                                let _ = resp_tx.send(IoResp::Error {
+                                    message: format!("{}: {}", fatx_path, e),
+                                });
+                                continue;
+                            }
                         }
                     }
                 }
