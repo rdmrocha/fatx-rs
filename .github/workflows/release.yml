@@ -75,10 +75,10 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --workspace --target ${{ matrix.target }}
 
-      - name: Package binaries
+      - name: Package binary
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.name }}.tar.gz fatx fatx-mount fatx-mkimage
+          tar czf ../../../${{ matrix.name }}.tar.gz fatx
           cd ../../..
 
       - name: Upload artifact
