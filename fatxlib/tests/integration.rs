@@ -220,6 +220,34 @@ fn test_large_file_256kb() {
     assert_eq!(read, data);
 }
 
+#[test]
+fn test_read_file_range_within_cluster() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    let data: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+    vol.create_file("/range.bin", &data).expect("create");
+
+    let entry = vol.resolve_path("/range.bin").expect("resolve");
+    let read = vol.read_file_range(&entry, 123, 777).expect("range read");
+    assert_eq!(read, data[123..900].to_vec());
+}
+
+#[test]
+fn test_read_file_range_shared_across_clusters() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    let data: Vec<u8> = (0..65536u32).map(|i| (i % 241) as u8).collect();
+    vol.create_file("/range-shared.bin", &data).expect("create");
+
+    let entry = vol.resolve_path("/range-shared.bin").expect("resolve");
+    let offset = 16_000u64;
+    let count = 20_000usize;
+    let read = vol
+        .read_file_range_shared(&entry, offset, count)
+        .expect("shared range read");
+    assert_eq!(read, data[offset as usize..offset as usize + count].to_vec());
+}
+
 // ===========================================================================
 // Delete operations
 // ===========================================================================
