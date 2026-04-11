@@ -851,3 +851,146 @@ fn test_write_in_place_nonexistent_fails() {
     let result = vol.write_file_in_place("/nope.bin", &[0xFF; 100]);
     assert!(result.is_err());
 }
+
+// ===========================================================================
+// copy_from_host bugs
+// ===========================================================================
+
+/// Bug: copy_from_host copies *contents* of source dir into --to, losing the
+/// source directory name. `cp -r ./ABCDEFG /dest/` should produce
+/// `/dest/ABCDEFG/...`, but copy_from_host produces `/dest/...`.
+#[test]
+fn test_copy_from_host_loses_source_dir_name() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    let local_tmp = tempfile::TempDir::new().unwrap();
+    let src = local_tmp.path().join("ABCDEFG");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("file1.bin"), b"hello").unwrap();
+
+    vol.create_directory("/dest").expect("mkdir dest");
+    vol.copy_from_host(&src, "/dest", None).expect("copy");
+
+    // BUG: source dir name "ABCDEFG" is not preserved — files land directly in /dest/
+    // This assertion documents the current (broken) behavior.
+    let dest_cluster = vol.resolve_path("/dest").unwrap().first_cluster;
+    let dest_entries = vol.read_directory(dest_cluster).unwrap();
+    let names: Vec<String> = dest_entries.iter().map(|e| e.filename()).collect();
+
+    // If fixed, /dest/ should contain a single directory "ABCDEFG".
+    // Currently it contains "file1.bin" directly (contents flattened).
+    assert!(
+        names.contains(&"file1.bin".to_string()),
+        "BUG: source dir contents should be flattened into dest (current behavior). Got: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"ABCDEFG".to_string()),
+        "BUG: source dir name ABCDEFG should NOT be preserved (current behavior). Got: {:?}",
+        names
+    );
+}
+
+/// Bug: copy_from_host with trailing slash on --to produces double-slash paths
+/// (e.g., "/dest//file.bin") which may cause issues.
+#[test]
+fn test_copy_from_host_trailing_slash_double_slash() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    let local_tmp = tempfile::TempDir::new().unwrap();
+    let src = local_tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("test.txt"), b"data").unwrap();
+
+    vol.create_directory("/dest").expect("mkdir dest");
+    // Trailing slash on dest_path
+    vol.copy_from_host(&src, "/dest/", None).expect("copy");
+
+    // The file should be readable despite the double-slash during creation.
+    // This confirms the path was normalized enough to work, or documents if it fails.
+    let result = vol.resolve_path("/dest/test.txt");
+    assert!(
+        result.is_ok(),
+        "File created via trailing-slash dest should be resolvable. Got: {:?}",
+        result.err()
+    );
+}
+
+/// Bug: create_file does not check for existing entries with the same name.
+/// Calling create_file twice with the same path produces duplicate directory
+/// entries — the second is unreachable via resolve_path but still occupies
+/// clusters, causing silent data corruption / cluster leaks.
+#[test]
+fn test_create_file_allows_duplicate_names() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    vol.create_file("/dup.bin", b"first").expect("create first");
+    // BUG: this should fail with FileExists, but it succeeds
+    let result = vol.create_file("/dup.bin", b"second");
+    assert!(
+        result.is_ok(),
+        "BUG: create_file should reject duplicates but currently allows them"
+    );
+
+    // Two entries exist in the root directory with the same name
+    let entries = vol.read_directory(FIRST_CLUSTER).unwrap();
+    let dup_count = entries.iter().filter(|e| e.filename() == "dup.bin").count();
+    assert_eq!(
+        dup_count, 2,
+        "BUG: two directory entries named 'dup.bin' exist (current behavior)"
+    );
+
+    // resolve_path returns the first one — second is orphaned
+    let data = vol.read_file_by_path("/dup.bin").unwrap();
+    assert_eq!(data, b"first", "resolve_path returns the first entry");
+}
+
+/// Bug: copy_from_host to the same destination twice creates duplicate file entries.
+#[test]
+fn test_copy_from_host_duplicate_on_recopy() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    let local_tmp = tempfile::TempDir::new().unwrap();
+    let src = local_tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("file.bin"), b"original").unwrap();
+
+    vol.copy_from_host(&src, "/dest", None).expect("first copy");
+    vol.copy_from_host(&src, "/dest", None).expect("second copy");
+
+    // BUG: file.bin appears twice in /dest
+    let dest = vol.resolve_path("/dest").unwrap();
+    let entries = vol.read_directory(dest.first_cluster).unwrap();
+    let file_count = entries.iter().filter(|e| e.filename() == "file.bin").count();
+    assert_eq!(
+        file_count, 2,
+        "BUG: duplicate file entries after re-copy (current behavior). Got {}",
+        file_count
+    );
+}
+
+/// Bug: create_directory rejects path that exists as a directory (FileExists),
+/// but create_file does NOT reject path that exists as a file OR directory.
+/// This asymmetry means create_file can create a file entry alongside an
+/// existing directory entry with the same name.
+#[test]
+fn test_create_file_alongside_existing_directory() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    vol.create_directory("/stuff").expect("mkdir");
+    // BUG: this should fail — "stuff" already exists as a directory
+    let result = vol.create_file("/stuff", b"oops");
+    assert!(
+        result.is_ok(),
+        "BUG: create_file allows creating a file with the same name as a directory"
+    );
+
+    // Now we have both a directory and a file named "stuff"
+    let entries = vol.read_directory(FIRST_CLUSTER).unwrap();
+    let stuff_entries: Vec<_> = entries.iter().filter(|e| e.filename() == "stuff").collect();
+    assert_eq!(
+        stuff_entries.len(),
+        2,
+        "BUG: both a dir and file named 'stuff' exist"
+    );
+}
