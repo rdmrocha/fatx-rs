@@ -629,25 +629,11 @@ impl NFSFileSystem for FatxNfs {
         let path_clone = path.clone();
         tokio::task::spawn_blocking(move || {
             let mut vol = vol.write();
-            match vol.create_file(&path_clone, &[]) {
-                Ok(()) => {}
-                Err(fatxlib::error::FatxError::FileExists(_)) => {
-                    // File already exists — delete and recreate (truncate)
-                    info!("NFS create: '{}' already exists, truncating", path_clone);
-                    if let Err(e) = vol.delete(&path_clone) {
-                        warn!("create truncate delete '{}': {}", path_clone, e);
-                        return Err(nfsstat3::NFS3ERR_IO);
-                    }
-                    vol.create_file(&path_clone, &[]).map_err(|e| {
-                        warn!("create after truncate '{}': {}", path_clone, e);
-                        nfsstat3::NFS3ERR_IO
-                    })?;
-                }
-                Err(e) => {
-                    warn!("create '{}': {}", path_clone, e);
-                    return Err(nfsstat3::NFS3ERR_IO);
-                }
-            }
+            // Truncate semantics: if file exists, replace it.
+            vol.create_or_replace_file(&path_clone, &[]).map_err(|e| {
+                warn!("create '{}': {}", path_clone, e);
+                nfsstat3::NFS3ERR_IO
+            })?;
             Ok::<(), nfsstat3>(())
         })
         .await
@@ -1487,7 +1473,7 @@ async fn async_main(cli: MountArgs) {
                                     Ok(chain) => chain,
                                     Err(fatxlib::error::FatxError::FileNotFound(_)) => {
                                         // File doesn't exist — create it (holds lock for full write)
-                                        if let Err(e) = vol.create_file(&path, &data) {
+                                        if let Err(e) = vol.create_or_replace_file(&path, &data) {
                                             error!("Flush create '{}' failed: {}", path, e);
                                         }
                                         continue;
@@ -1816,8 +1802,7 @@ async fn async_main(cli: MountArgs) {
                             match vol.write_file_in_place(path, data) {
                                 Ok(()) => {}
                                 Err(_) => {
-                                    let _ = vol.delete(path);
-                                    if let Err(e) = vol.create_file(path, data) {
+                                    if let Err(e) = vol.create_or_replace_file(path, data) {
                                         eprintln!("[shutdown] Failed to flush '{}': {}", path, e);
                                     }
                                 }

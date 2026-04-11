@@ -1166,6 +1166,22 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         Ok(())
     }
 
+    /// Create or replace a file at the specified path.
+    ///
+    /// If the file already exists, it is deleted first and then recreated.
+    /// Use this when overwrite-on-conflict is the desired behavior (e.g., NFS
+    /// flush paths). For strict create-only semantics, use `create_file`.
+    pub fn create_or_replace_file(&mut self, path: &str, data: &[u8]) -> Result<()> {
+        match self.create_file(path, data) {
+            Ok(()) => Ok(()),
+            Err(FatxError::FileExists(_)) => {
+                self.delete(path)?;
+                self.create_file(path, data)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Create a new directory at the specified path.
     pub fn create_directory(&mut self, path: &str) -> Result<()> {
         let (parent_path, dirname) = split_path(path);
