@@ -59,8 +59,11 @@ pub struct FatxVolume<T: Read + Write + Seek> {
     free_bitmap: Vec<u64>,
 }
 
+/// Progress callback: `(fatx_path, file_size, total_bytes_so_far)`.
+type ProgressFn<'a> = &'a dyn Fn(&str, u64, u64);
+
 struct CopyFromHostState<'a> {
-    progress: Option<&'a dyn Fn(&str, u64, u64)>,
+    progress: Option<ProgressFn<'a>>,
     should_abort: Option<&'a dyn Fn() -> bool>,
     flush_every_files: usize,
     flush_every_bytes: u64,
@@ -1610,12 +1613,11 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
     /// Recursively copy a local directory tree into the FATX volume.
     /// Opens volume once and writes all files/dirs in a single session.
-    #[allow(clippy::type_complexity)]
     pub fn copy_from_host(
         &mut self,
         local_path: &std::path::Path,
         dest_path: &str,
-        progress: Option<&dyn Fn(&str, u64, u64)>,
+        progress: Option<ProgressFn<'_>>,
     ) -> Result<(usize, usize, u64)> {
         self.copy_from_host_with_control(local_path, dest_path, progress, None, 0, 0)
     }
@@ -1624,7 +1626,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         &mut self,
         local_path: &std::path::Path,
         dest_path: &str,
-        progress: Option<&dyn Fn(&str, u64, u64)>,
+        progress: Option<ProgressFn<'_>>,
         should_abort: Option<&dyn Fn() -> bool>,
         flush_every_files: usize,
         flush_every_bytes: u64,
