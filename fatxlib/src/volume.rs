@@ -3,6 +3,7 @@
 //! A `FatxVolume` wraps a seekable reader/writer (file, block device, or disk image)
 //! and provides methods to navigate directories, read files, and perform write operations.
 
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use log::{info, warn};
@@ -793,7 +794,10 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
     fn read_dirent_at(&mut self, partition_rel: u64) -> Result<DirectoryEntry> {
         let mut buf = [0u8; DIRENT_SIZE];
         self.read_at(partition_rel, &mut buf)?;
+        Ok(self.parse_dirent_buf(&buf))
+    }
 
+    fn parse_dirent_buf(&self, buf: &[u8; DIRENT_SIZE]) -> DirectoryEntry {
         let filename_len = buf[0];
         let attributes = FileAttributes::from_bits_truncate(buf[1]);
         let mut filename_raw = [0u8; MAX_FILENAME_LEN];
@@ -836,7 +840,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             )
         };
 
-        Ok(DirectoryEntry {
+        DirectoryEntry {
             filename_len,
             attributes,
             filename_raw,
@@ -848,7 +852,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             write_date,
             access_time,
             access_date,
-        })
+        }
     }
 
     /// Read all valid directory entries from a directory cluster chain.
@@ -936,22 +940,40 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
     /// Read the full contents of a file given its directory entry.
     pub fn read_file(&mut self, entry: &DirectoryEntry) -> Result<Vec<u8>> {
+        self.read_file_range(entry, 0, entry.file_size as usize)
+    }
+
+    /// Read a byte range from a file given its directory entry.
+    pub fn read_file_range(
+        &mut self,
+        entry: &DirectoryEntry,
+        offset: u64,
+        count: usize,
+    ) -> Result<Vec<u8>> {
         if entry.is_directory() {
             return Err(FatxError::IsADirectory(entry.filename()));
         }
 
+        let file_size = entry.file_size as usize;
+        let start = offset as usize;
+        if start >= file_size || count == 0 {
+            return Ok(Vec::new());
+        }
+
         let chain = self.read_chain(entry.first_cluster)?;
         let cluster_size = self.superblock.cluster_size() as usize;
-        let file_size = entry.file_size as usize;
-        let mut data = Vec::with_capacity(file_size);
-        let mut remaining = file_size;
+        let mut data = Vec::with_capacity(count.min(file_size - start));
+        let mut remaining = count.min(file_size - start);
+        let start_cluster_idx = start / cluster_size;
+        let mut offset_in_cluster = start % cluster_size;
 
-        for &cluster in &chain {
-            let to_read = remaining.min(cluster_size);
+        for &cluster in chain.iter().skip(start_cluster_idx) {
+            let to_read = remaining.min(cluster_size - offset_in_cluster);
             let mut buf = vec![0u8; cluster_size];
             self.read_cluster(cluster, &mut buf)?;
-            data.extend_from_slice(&buf[..to_read]);
+            data.extend_from_slice(&buf[offset_in_cluster..offset_in_cluster + to_read]);
             remaining -= to_read;
+            offset_in_cluster = 0;
             if remaining == 0 {
                 break;
             }
@@ -1142,6 +1164,22 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             clusters_needed
         );
         Ok(())
+    }
+
+    /// Create or replace a file at the specified path.
+    ///
+    /// If the file already exists, it is deleted first and then recreated.
+    /// Use this when overwrite-on-conflict is the desired behavior (e.g., NFS
+    /// flush paths). For strict create-only semantics, use `create_file`.
+    pub fn create_or_replace_file(&mut self, path: &str, data: &[u8]) -> Result<()> {
+        match self.create_file(path, data) {
+            Ok(()) => Ok(()),
+            Err(FatxError::FileExists(_)) => {
+                self.delete(path)?;
+                self.create_file(path, data)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Create a new directory at the specified path.
@@ -1751,6 +1789,121 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             free_size: free_clusters as u64 * cluster_size,
             used_size: used_clusters as u64 * cluster_size,
         })
+    }
+}
+
+impl FatxVolume<File> {
+    // Use positional reads so shared readers don't need to mutate the file
+    // cursor. This is the basis for serving NFS reads under `vol.read()`.
+    fn read_exact_abs(&self, abs_offset: u64, buf: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+
+        let mut read = 0usize;
+        while read < buf.len() {
+            let n = self
+                .inner
+                .read_at(&mut buf[read..], abs_offset + read as u64)?;
+            if n == 0 {
+                return Err(FatxError::Io(std::io::Error::from(
+                    std::io::ErrorKind::UnexpectedEof,
+                )));
+            }
+            read += n;
+        }
+        Ok(())
+    }
+
+    fn read_at_shared(&self, partition_rel: u64, buf: &mut [u8]) -> Result<()> {
+        let abs = self.abs_offset(partition_rel);
+        let aligned_start = self.align_down(abs);
+        let pre_skip = (abs - aligned_start) as usize;
+        let total_needed = pre_skip + buf.len();
+        let aligned_len = self.align_up(total_needed);
+
+        let mut aligned_buf = vec![0u8; aligned_len];
+        self.read_exact_abs(aligned_start, &mut aligned_buf)?;
+        buf.copy_from_slice(&aligned_buf[pre_skip..pre_skip + buf.len()]);
+        Ok(())
+    }
+
+    fn read_cluster_shared(&self, cluster: u32, buf: &mut [u8]) -> Result<()> {
+        let offset = self.cluster_offset(cluster)?;
+        self.read_at_shared(offset, buf)?;
+        Ok(())
+    }
+
+    fn read_dirent_at_shared(&self, partition_rel: u64) -> Result<DirectoryEntry> {
+        let mut buf = [0u8; DIRENT_SIZE];
+        self.read_at_shared(partition_rel, &mut buf)?;
+        Ok(self.parse_dirent_buf(&buf))
+    }
+
+    pub fn read_directory_shared(&self, first_cluster: u32) -> Result<Vec<DirectoryEntry>> {
+        let chain = self.read_chain(first_cluster)?;
+        let cluster_size = self.superblock.cluster_size() as usize;
+        let entries_per_cluster = cluster_size / DIRENT_SIZE;
+        let mut entries = Vec::new();
+
+        for &cluster in &chain {
+            let base_offset = self.cluster_offset(cluster)?;
+
+            for slot in 0..entries_per_cluster {
+                let slot_offset = base_offset + (slot * DIRENT_SIZE) as u64;
+                let entry = self.read_dirent_at_shared(slot_offset)?;
+                if entry.is_end() {
+                    return Ok(entries);
+                }
+                if !entry.is_deleted() {
+                    entries.push(entry);
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
+    pub fn read_root_directory_shared(&self) -> Result<Vec<DirectoryEntry>> {
+        self.read_directory_shared(FIRST_CLUSTER)
+    }
+
+    pub fn read_file_range_shared(
+        &self,
+        entry: &DirectoryEntry,
+        offset: u64,
+        count: usize,
+    ) -> Result<Vec<u8>> {
+        if entry.is_directory() {
+            return Err(FatxError::IsADirectory(entry.filename()));
+        }
+
+        let file_size = entry.file_size as usize;
+        let start = offset as usize;
+        if start >= file_size || count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let chain = self.read_chain(entry.first_cluster)?;
+        let cluster_size = self.superblock.cluster_size() as usize;
+        // Walk only the clusters covering the requested byte range. This avoids
+        // materializing the whole file just to satisfy one NFS read chunk.
+        let mut data = Vec::with_capacity(count.min(file_size - start));
+        let mut remaining = count.min(file_size - start);
+        let start_cluster_idx = start / cluster_size;
+        let mut offset_in_cluster = start % cluster_size;
+
+        for &cluster in chain.iter().skip(start_cluster_idx) {
+            let to_read = remaining.min(cluster_size - offset_in_cluster);
+            let mut buf = vec![0u8; cluster_size];
+            self.read_cluster_shared(cluster, &mut buf)?;
+            data.extend_from_slice(&buf[offset_in_cluster..offset_in_cluster + to_read]);
+            remaining -= to_read;
+            offset_in_cluster = 0;
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        Ok(data)
     }
 }
 

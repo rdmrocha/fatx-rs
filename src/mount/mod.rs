@@ -41,6 +41,19 @@ fn id_to_cluster(id: fileid3) -> u32 {
     id as u32
 }
 
+// Slice from the buffered in-memory file image used by delayed NFS writes.
+// Reads consult this first so they can observe unflushed writes.
+fn slice_buffered_range(buffered: &[u8], offset: u64, count: u32) -> (Vec<u8>, bool) {
+    let start = offset as usize;
+    if start >= buffered.len() {
+        return (vec![], true);
+    }
+
+    let end = (start + count as usize).min(buffered.len());
+    let eof = end >= buffered.len();
+    (buffered[start..end].to_vec(), eof)
+}
+
 /// Convert FATX packed date+time to nfstime3.
 fn fatx_to_nfstime(date: u16, time: u16) -> nfstime3 {
     let year = ((date >> 9) & 0x7F) as i32 + 1980;
@@ -225,11 +238,13 @@ impl FatxNfs {
             }
 
             let t0 = Instant::now();
-            let mut vol = vol.write(); // write lock — device I/O
+            // Shared lock is safe here because `fatxlib` uses positional reads
+            // for the shared-directory path instead of mutating the file cursor.
+            let vol = vol.read();
             let entries = if cluster == FIRST_CLUSTER {
-                vol.read_root_directory()
+                vol.read_root_directory_shared()
             } else {
-                vol.read_directory(cluster)
+                vol.read_directory_shared(cluster)
             };
             let elapsed = t0.elapsed();
 
@@ -433,9 +448,19 @@ impl NFSFileSystem for FatxNfs {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
+        self.touch_io();
         let t0 = Instant::now();
 
         let cluster = id_to_cluster(id);
+
+        // Reads must reflect buffered-but-not-yet-flushed writes without
+        // cloning the whole file into the read cache on every chunk.
+        {
+            let dirty = self.dirty_files.lock();
+            if let Some((_, buffered)) = dirty.get(&cluster) {
+                return Ok(slice_buffered_range(buffered, offset, count));
+            }
+        }
 
         // Fast path: serve from file cache without any USB I/O
         {
@@ -468,7 +493,7 @@ impl NFSFileSystem for FatxNfs {
             }
         }
 
-        // Cache miss — find the directory entry, then read the whole file once
+        // Cache miss — find the directory entry, then read only the requested range
         let parent_cluster = {
             let parents = self.inode_parents.read();
             parents.get(&cluster).map(|(p, _)| *p)
@@ -482,25 +507,26 @@ impl NFSFileSystem for FatxNfs {
         };
 
         let entry = entry.ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let entry_for_read = entry.clone();
 
         let vol = Arc::clone(&self.vol);
-        let file_cache = Arc::clone(&self.file_cache);
         let data = tokio::task::spawn_blocking(move || {
             let t0 = Instant::now();
-            let mut vol = vol.write(); // write lock — device I/O
-            match vol.read_file(&entry) {
+            // Shared lock is enough here because the range-read path is
+            // implemented with positional reads in fatxlib.
+            let vol = vol.read();
+            match vol.read_file_range_shared(&entry_for_read, offset, count as usize) {
                 Ok(data) => {
                     let elapsed = t0.elapsed();
                     info!(
-                        "file read cluster {} ({} bytes) in {:.1}ms from USB",
+                        "file range read cluster {} offset={} count={} -> {} bytes ({:.1}ms USB)",
                         cluster,
+                        offset,
+                        count,
                         data.len(),
                         elapsed.as_secs_f64() * 1000.0
                     );
-                    // Cache as Bytes for zero-copy NFS responses
-                    let bytes_data = Bytes::from(data);
-                    file_cache.insert(cluster, bytes_data.clone());
-                    Ok(bytes_data)
+                    Ok(data)
                 }
                 Err(e) => {
                     warn!("read cluster {}: {}", cluster, e);
@@ -511,17 +537,21 @@ impl NFSFileSystem for FatxNfs {
         .await
         .unwrap_or(Err(nfsstat3::NFS3ERR_IO))?;
 
-        let start = offset as usize;
-        let end = (start + count as usize).min(data.len());
-        if start >= data.len() {
-            Ok((vec![], true))
-        } else {
-            let eof = end >= data.len();
-            Ok((data.slice(start..end).to_vec(), eof))
-        }
+        let eof = offset as usize + data.len() >= entry.file_size as usize;
+        debug!(
+            "NFS read: id={} offset={} count={} -> {} bytes, eof={} ({:.1}ms)",
+            id,
+            offset,
+            count,
+            data.len(),
+            eof,
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok((data, eof))
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        self.touch_io();
         let t0 = Instant::now();
         self.check_writable()?;
 
@@ -568,15 +598,6 @@ impl NFSFileSystem for FatxNfs {
             buf.0 = path;
         }
 
-        // Also update the file_cache so subsequent reads see the buffered data
-        {
-            let dirty = self.dirty_files.lock();
-            if let Some((_, ref buf_data)) = dirty.get(&cluster) {
-                self.file_cache
-                    .insert(cluster, Bytes::copy_from_slice(buf_data));
-            }
-        }
-
         self.flush_needed.store(true, Ordering::Relaxed);
 
         debug!(
@@ -608,25 +629,11 @@ impl NFSFileSystem for FatxNfs {
         let path_clone = path.clone();
         tokio::task::spawn_blocking(move || {
             let mut vol = vol.write();
-            match vol.create_file(&path_clone, &[]) {
-                Ok(()) => {}
-                Err(fatxlib::error::FatxError::FileExists(_)) => {
-                    // File already exists — delete and recreate (truncate)
-                    info!("NFS create: '{}' already exists, truncating", path_clone);
-                    if let Err(e) = vol.delete(&path_clone) {
-                        warn!("create truncate delete '{}': {}", path_clone, e);
-                        return Err(nfsstat3::NFS3ERR_IO);
-                    }
-                    vol.create_file(&path_clone, &[]).map_err(|e| {
-                        warn!("create after truncate '{}': {}", path_clone, e);
-                        nfsstat3::NFS3ERR_IO
-                    })?;
-                }
-                Err(e) => {
-                    warn!("create '{}': {}", path_clone, e);
-                    return Err(nfsstat3::NFS3ERR_IO);
-                }
-            }
+            // Truncate semantics: if file exists, replace it.
+            vol.create_or_replace_file(&path_clone, &[]).map_err(|e| {
+                warn!("create '{}': {}", path_clone, e);
+                nfsstat3::NFS3ERR_IO
+            })?;
             Ok::<(), nfsstat3>(())
         })
         .await
@@ -734,6 +741,13 @@ impl NFSFileSystem for FatxNfs {
 
         info!("NFS remove: dir={} name=\"{}\"", dirid, name_str);
         let path = self.resolve_fatx_path(dirid, name_str);
+        let removed_cluster = {
+            let entries = self.get_dir_entries(id_to_cluster(dirid)).await?;
+            entries
+                .into_iter()
+                .find(|e| e.filename().eq_ignore_ascii_case(name_str))
+                .map(|e| e.first_cluster)
+        };
         let vol = Arc::clone(&self.vol);
         let path_clone = path.clone();
         tokio::task::spawn_blocking(move || {
@@ -757,6 +771,13 @@ impl NFSFileSystem for FatxNfs {
         })
         .await
         .unwrap_or(Err(nfsstat3::NFS3ERR_IO))?;
+
+        if let Some(cluster) = removed_cluster {
+            // Drop any delayed-write state for the deleted file so the periodic
+            // flush cannot recreate it after the delete has succeeded.
+            self.dirty_files.lock().remove(&cluster);
+            self.file_cache.remove(&cluster);
+        }
 
         self.flush_needed.store(true, Ordering::Relaxed);
 
@@ -1236,7 +1257,6 @@ async fn async_main(cli: MountArgs) {
     let shutdown_flush_flag = Arc::clone(&fs.flush_needed);
     let shutdown_dirty = Arc::clone(&fs.dirty_files);
     let shutdown_dir_cache = Arc::clone(&fs.dir_cache);
-    let shutdown_file_cache = Arc::clone(&fs.file_cache);
 
     let bind_addr = format!("127.0.0.1:{}", cli.port);
     info!("Binding NFS server to {}...", bind_addr);
@@ -1423,6 +1443,12 @@ async fn async_main(cli: MountArgs) {
                     let pending: Vec<(u32, String, Vec<u8>)> = {
                         let mut dirty = dirty.lock();
                         let taken = std::mem::take(&mut *dirty);
+                        for (cluster, (_path, data)) in &taken {
+                            // Publish the buffered view once per flush cycle so
+                            // reads stay coherent while cluster writes are in
+                            // flight after `dirty_files` has been drained.
+                            file_cache.insert(*cluster, Bytes::copy_from_slice(data));
+                        }
                         taken
                             .into_iter()
                             .map(|(cluster, (path, data))| (cluster, path, data))
@@ -1436,7 +1462,7 @@ async fn async_main(cli: MountArgs) {
                         // The vol lock is held briefly for FAT chain management,
                         // then released between each cluster write so NFS reads
                         // (Finder browsing) can interleave.
-                        for (cluster, path, data) in pending {
+                        for (_cluster, path, data) in pending {
                             let ft = Instant::now();
                             let data_len = data.len();
 
@@ -1447,10 +1473,9 @@ async fn async_main(cli: MountArgs) {
                                     Ok(chain) => chain,
                                     Err(fatxlib::error::FatxError::FileNotFound(_)) => {
                                         // File doesn't exist — create it (holds lock for full write)
-                                        if let Err(e) = vol.create_file(&path, &data) {
+                                        if let Err(e) = vol.create_or_replace_file(&path, &data) {
                                             error!("Flush create '{}' failed: {}", path, e);
                                         }
-                                        file_cache.insert(cluster, Bytes::from(data));
                                         continue;
                                     }
                                     Err(e) => {
@@ -1487,9 +1512,6 @@ async fn async_main(cli: MountArgs) {
                                     break;
                                 }
                             }
-
-                            // Update file cache with the flushed data
-                            file_cache.insert(cluster, Bytes::from(data));
 
                             info!(
                                 "Flushed '{}' ({} bytes, {:.1}ms)",
@@ -1612,7 +1634,6 @@ async fn async_main(cli: MountArgs) {
             let disk_flush_flag = Arc::clone(&shutdown_flush_flag);
             let disk_dirty = Arc::clone(&shutdown_dirty);
             let _disk_dir_cache = Arc::clone(&shutdown_dir_cache);
-            let _disk_file_cache = Arc::clone(&shutdown_file_cache);
             let disappeared_for_task = Arc::clone(&disappeared);
 
             tokio::spawn(async move {
@@ -1781,16 +1802,11 @@ async fn async_main(cli: MountArgs) {
                             match vol.write_file_in_place(path, data) {
                                 Ok(()) => {}
                                 Err(_) => {
-                                    let _ = vol.delete(path);
-                                    if let Err(e) = vol.create_file(path, data) {
+                                    if let Err(e) = vol.create_or_replace_file(path, data) {
                                         eprintln!("[shutdown] Failed to flush '{}': {}", path, e);
                                     }
                                 }
                             }
-                        }
-                        // Update file cache (not strictly needed at shutdown, but consistent)
-                        for (cluster, (_path, data)) in pending {
-                            shutdown_file_cache.insert(cluster, Bytes::from(data));
                         }
                         // Dir cache entries don't need clearing at shutdown
                     }
@@ -1909,5 +1925,37 @@ mod tests {
         let file_cache: HashMap<u32, Vec<u8>> = HashMap::new();
         assert!(dir_cache.is_empty());
         assert!(file_cache.is_empty());
+    }
+
+    #[test]
+    fn test_slice_buffered_range_middle() {
+        let data = b"abcdefghij";
+        let (slice, eof) = slice_buffered_range(data, 3, 4);
+        assert_eq!(slice, b"defg");
+        assert!(!eof);
+    }
+
+    #[test]
+    fn test_slice_buffered_range_past_end() {
+        let data = b"abcdefghij";
+        let (slice, eof) = slice_buffered_range(data, 20, 4);
+        assert!(slice.is_empty());
+        assert!(eof);
+    }
+
+    #[test]
+    fn test_slice_buffered_range_from_start_to_end() {
+        let data = b"abcdefghij";
+        let (slice, eof) = slice_buffered_range(data, 0, 32);
+        assert_eq!(slice, data);
+        assert!(eof);
+    }
+
+    #[test]
+    fn test_slice_buffered_range_exact_last_byte() {
+        let data = b"abcdefghij";
+        let (slice, eof) = slice_buffered_range(data, 9, 1);
+        assert_eq!(slice, b"j");
+        assert!(eof);
     }
 }
