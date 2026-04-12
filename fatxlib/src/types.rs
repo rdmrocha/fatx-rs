@@ -408,3 +408,14 @@ pub fn all_known_partitions() -> Vec<&'static XboxPartition> {
     }
     all
 }
+
+/// Check if a filename is macOS metadata that should be skipped when copying
+/// local directories to a FATX volume. These files are created automatically
+/// by Finder and have no meaning on an Xbox drive.
+pub fn is_macos_metadata(name: &str) -> bool {
+    name == ".DS_Store"
+        || name == ".Spotlight-V100"
+        || name == ".Trashes"
+        || name == ".fseventsd"
+        || name.starts_with("._")
+}

@@ -851,3 +851,52 @@ fn test_write_in_place_nonexistent_fails() {
     let result = vol.write_file_in_place("/nope.bin", &[0xFF; 100]);
     assert!(result.is_err());
 }
+
+// ===========================================================================
+// macOS metadata filtering
+// ===========================================================================
+
+/// copy_from_host should skip macOS metadata files (.DS_Store, ._ prefixed, etc.)
+#[test]
+fn test_copy_from_host_skips_macos_metadata() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    let local_tmp = tempfile::TempDir::new().unwrap();
+    let src = local_tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("game.bin"), b"real file").unwrap();
+    std::fs::write(src.join(".DS_Store"), b"macos junk").unwrap();
+    std::fs::write(src.join("._game.bin"), b"resource fork").unwrap();
+    std::fs::create_dir(src.join(".Spotlight-V100")).unwrap();
+    std::fs::write(src.join(".Spotlight-V100").join("index"), b"idx").unwrap();
+    std::fs::create_dir(src.join(".Trashes")).unwrap();
+    std::fs::create_dir(src.join(".fseventsd")).unwrap();
+
+    vol.copy_from_host(&src, "/dest", None).expect("copy");
+
+    // Only game.bin should exist on the volume
+    let dest = vol.resolve_path("/dest").unwrap();
+    let entries = vol.read_directory(dest.first_cluster).unwrap();
+    let names: Vec<String> = entries.iter().map(|e| e.filename()).collect();
+
+    assert_eq!(names, vec!["game.bin"], "only real files should be copied, got: {:?}", names);
+}
+
+/// is_macos_metadata should match the expected patterns.
+#[test]
+fn test_is_macos_metadata() {
+    use fatxlib::types::is_macos_metadata;
+
+    assert!(is_macos_metadata(".DS_Store"));
+    assert!(is_macos_metadata(".Spotlight-V100"));
+    assert!(is_macos_metadata(".Trashes"));
+    assert!(is_macos_metadata(".fseventsd"));
+    assert!(is_macos_metadata("._anything"));
+    assert!(is_macos_metadata("._Icon\r"));
+    assert!(is_macos_metadata("._"));
+
+    assert!(!is_macos_metadata("game.bin"));
+    assert!(!is_macos_metadata("Content"));
+    assert!(!is_macos_metadata(".hidden"));
+    assert!(!is_macos_metadata("DS_Store")); // no leading dot
+}

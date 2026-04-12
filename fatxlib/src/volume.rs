@@ -1600,6 +1600,13 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             let entry = entry.map_err(|e| FatxError::Io(std::io::Error::other(e.to_string())))?;
             let local_child = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
+
+            // Skip macOS metadata files — meaningless on Xbox, wastes clusters
+            if crate::types::is_macos_metadata(&name) {
+                info!("Skipping macOS metadata: {}", name);
+                continue;
+            }
+
             let fatx_child = if dest_path == "/" {
                 format!("/{}", name)
             } else {

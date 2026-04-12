@@ -299,15 +299,9 @@ impl FatxNfs {
     }
 
     /// Check if a filename is macOS metadata that should be silently rejected.
-    /// Finder creates .DS_Store and ._ (AppleDouble) files on any writeable volume.
-    /// These are meaningless on an Xbox drive and waste clusters.
     #[allow(dead_code)] // used by tests; may be re-enabled for NFS filtering later
     fn is_macos_metadata(name: &str) -> bool {
-        name == ".DS_Store"
-            || name == ".Spotlight-V100"
-            || name == ".Trashes"
-            || name == ".fseventsd"
-            || name.starts_with("._")
+        fatxlib::types::is_macos_metadata(name)
     }
 
     /// Invalidate the directory cache for a parent cluster, plus any cached
@@ -973,13 +967,12 @@ fn get_device_size(file: &mut File) -> u64 {
 #[derive(clap::Args)]
 #[command(about = "Mount Xbox FATX/XTAF file systems (shows in Finder)")]
 pub struct MountArgs {
-    /// Device or disk image to mount
-    #[arg(required_unless_present = "cleanup")]
+    /// Device or disk image to mount (omit for guided selection)
     pub device: Option<PathBuf>,
 
     /// Partition name (e.g. "360 Data", "Data (E)")
     #[arg(long)]
-    partition: Option<String>,
+    pub partition: Option<String>,
 
     /// Manual partition offset (hex or decimal)
     #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
@@ -1013,12 +1006,12 @@ pub struct MountArgs {
     /// Without this flag, only the NFS server starts and you can
     /// test with: showmount -e localhost
     #[arg(long)]
-    mount: bool,
+    pub mount: bool,
 
     /// Emergency cleanup: kill stale NFS mounts and exit.
     /// Use this if a previous fatx-mount session left a zombie mount.
     #[arg(long)]
-    cleanup: bool,
+    pub cleanup: bool,
 }
 
 /// Entry point for the mount subcommand. Creates a tokio runtime and runs the async main.

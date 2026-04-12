@@ -625,6 +625,11 @@ fn collect_files(local_dir: &PathBuf, fatx_dir: &str, out: &mut Vec<(PathBuf, St
     for entry in entries.flatten() {
         let local_child = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
+
+        if fatxlib::types::is_macos_metadata(&name) {
+            continue;
+        }
+
         let fatx_child = format!("{}/{}", fatx_dir, name);
 
         if local_child.is_dir() {
@@ -649,6 +654,9 @@ fn create_dirs_recursive(vol: &mut FatxVolume<std::fs::File>, local_dir: &PathBu
     for entry in entries.flatten() {
         if entry.path().is_dir() {
             let name = entry.file_name().to_string_lossy().to_string();
+            if fatxlib::types::is_macos_metadata(&name) {
+                continue;
+            }
             let fatx_child = format!("{}/{}", fatx_dir, name);
             create_dirs_recursive(vol, &entry.path(), &fatx_child);
         }
