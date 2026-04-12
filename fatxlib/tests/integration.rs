@@ -901,9 +901,9 @@ fn test_is_macos_metadata() {
     assert!(!is_macos_metadata("DS_Store")); // no leading dot
 }
 
-/// cleanup_macos_metadata should remove macOS files from the volume.
+/// scan_macos_metadata finds macOS files; delete_macos_metadata removes them.
 #[test]
-fn test_cleanup_macos_metadata() {
+fn test_scan_and_delete_macos_metadata() {
     let (_tmp, mut vol) = common::create_fatx_image(4);
 
     // Create a mix of real files and macOS junk
@@ -913,11 +913,19 @@ fn test_cleanup_macos_metadata() {
     vol.create_file("/Content/._game.bin", b"resource fork").expect("create resource");
     vol.create_file("/.DS_Store", b"root junk").expect("create root ds_store");
 
-    let (files, dirs, bytes) = vol.cleanup_macos_metadata(None).expect("cleanup");
+    // Scan first — non-destructive
+    let found = vol.scan_macos_metadata().expect("scan");
+    assert_eq!(found.len(), 3, "should find 3 metadata entries");
+    assert!(found.iter().all(|e| !e.is_dir), "all should be files");
 
-    assert_eq!(files, 3, "should delete 3 metadata files");
-    assert_eq!(dirs, 0, "no metadata dirs in this test");
-    assert!(bytes > 0, "should free some bytes");
+    // Everything still exists after scan
+    assert!(vol.resolve_path("/Content/.DS_Store").is_ok());
+
+    // Now delete
+    let (files, dirs, bytes) = vol.delete_macos_metadata(&found, None).expect("delete");
+    assert_eq!(files, 3);
+    assert_eq!(dirs, 0);
+    assert!(bytes > 0);
 
     // Real files survive
     assert!(vol.resolve_path("/Content/game.bin").is_ok());
@@ -925,4 +933,13 @@ fn test_cleanup_macos_metadata() {
     assert!(vol.resolve_path("/Content/.DS_Store").is_err());
     assert!(vol.resolve_path("/Content/._game.bin").is_err());
     assert!(vol.resolve_path("/.DS_Store").is_err());
+}
+
+/// scan_macos_metadata returns empty when no metadata exists.
+#[test]
+fn test_scan_macos_metadata_empty_volume() {
+    let (_tmp, mut vol) = common::create_fatx_image(2);
+    vol.create_file("/game.bin", b"data").expect("create");
+    let found = vol.scan_macos_metadata().expect("scan");
+    assert!(found.is_empty());
 }

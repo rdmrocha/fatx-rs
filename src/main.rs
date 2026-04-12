@@ -288,6 +288,9 @@ enum Commands {
     /// Remove macOS metadata files (.DS_Store, ._ files, etc.) from the volume
     Cleanup {
         device: PathBuf,
+        /// Show what would be deleted without actually deleting
+        #[arg(long)]
+        dry_run: bool,
         #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
         offset: u64,
         #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
@@ -595,24 +598,46 @@ fn interactive_mode() {
             }
             "10" | "cleanup" => {
                 println!("  Scanning for macOS metadata files...\n");
-                let progress = |path: &str| {
-                    println!("  Deleting {}", path);
-                };
-                match vol.cleanup_macos_metadata(Some(&progress)) {
-                    Ok((files, dirs, bytes)) => {
-                        let _ = vol.flush();
-                        if files == 0 && dirs == 0 {
+                match vol.scan_macos_metadata() {
+                    Ok(found) => {
+                        if found.is_empty() {
                             println!("  No macOS metadata found.");
                         } else {
+                            let total_bytes: u64 = found.iter().map(|e| e.size).sum();
+                            let file_count = found.iter().filter(|e| !e.is_dir).count();
+                            let dir_count = found.iter().filter(|e| e.is_dir).count();
+                            println!("  Found:");
+                            for entry in &found {
+                                let kind = if entry.is_dir { "dir " } else { "file" };
+                                println!("    [{}] {} ({})", kind, entry.path, format_size(entry.size));
+                            }
                             println!(
-                                "\n  Removed {} file(s), {} dir(s), freed {}",
-                                files,
-                                dirs,
-                                format_size(bytes)
+                                "\n  {} file(s), {} dir(s), {} to free",
+                                file_count, dir_count, format_size(total_bytes)
                             );
+                            print!("\n  Delete all? (y/n): ");
+                            io::stdout().flush().unwrap();
+                            let ans = read_line();
+                            if ans.trim().starts_with('y') || ans.trim().starts_with('Y') {
+                                let progress = |path: &str| {
+                                    println!("  Deleting {}", path);
+                                };
+                                match vol.delete_macos_metadata(&found, Some(&progress)) {
+                                    Ok((files, dirs, bytes)) => {
+                                        let _ = vol.flush();
+                                        println!(
+                                            "\n  Removed {} file(s), {} dir(s), freed {}",
+                                            files, dirs, format_size(bytes)
+                                        );
+                                    }
+                                    Err(e) => eprintln!("  Error during cleanup: {}", e),
+                                }
+                            } else {
+                                println!("  Cancelled.");
+                            }
                         }
                     }
-                    Err(e) => eprintln!("  Error during cleanup: {}", e),
+                    Err(e) => eprintln!("  Error scanning: {}", e),
                 }
             }
             "0" | "quit" | "exit" | "q" => {
@@ -2133,47 +2158,98 @@ fn main() {
 
         Some(Commands::Cleanup {
             device,
+            dry_run,
             offset,
             size,
             partition,
         }) => {
             let mut vol = open_volume(&device, &partition, offset, size);
-            let progress = |path: &str| {
-                if !json {
-                    eprintln!("  Deleting {}", path);
+            let found = vol.scan_macos_metadata().unwrap_or_else(|e| {
+                if json {
+                    println!("{}", serde_json::json!({"error": format!("{}", e)}));
+                    process::exit(0);
                 }
-            };
-            match vol.cleanup_macos_metadata(Some(&progress)) {
-                Ok((files, dirs, bytes)) => {
-                    vol.flush().unwrap();
-                    let msg = format!(
-                        "Removed {} file(s), {} dir(s), freed {}",
-                        files,
-                        dirs,
-                        format_size(bytes)
+                eprintln!("Error scanning: {}", e);
+                process::exit(1);
+            });
+
+            if found.is_empty() {
+                let msg = "No macOS metadata found";
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"success": true, "message": msg, "files": 0, "dirs": 0, "bytes": 0})
                     );
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "success": true,
-                                "message": msg,
-                                "files_deleted": files,
-                                "dirs_deleted": dirs,
-                                "bytes_freed": bytes
-                            })
-                        );
-                    } else {
-                        println!("{}", msg);
-                    }
+                } else {
+                    println!("{}", msg);
                 }
-                Err(e) => {
-                    if json {
-                        println!("{}", serde_json::json!({"error": format!("{}", e)}));
-                        process::exit(0);
+            } else if dry_run {
+                let total_bytes: u64 = found.iter().map(|e| e.size).sum();
+                let file_count = found.iter().filter(|e| !e.is_dir).count();
+                let dir_count = found.iter().filter(|e| e.is_dir).count();
+                if !json {
+                    println!("Would delete:");
+                    for entry in &found {
+                        let kind = if entry.is_dir { "dir " } else { "file" };
+                        println!("  [{}] {} ({})", kind, entry.path, format_size(entry.size));
                     }
-                    eprintln!("Error: {}", e);
-                    process::exit(1);
+                    println!(
+                        "\n{} file(s), {} dir(s), {} would be freed",
+                        file_count,
+                        dir_count,
+                        format_size(total_bytes)
+                    );
+                } else {
+                    let paths: Vec<&str> = found.iter().map(|e| e.path.as_str()).collect();
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "dry_run": true,
+                            "files": file_count,
+                            "dirs": dir_count,
+                            "bytes": total_bytes,
+                            "entries": paths
+                        })
+                    );
+                }
+            } else {
+                let progress = |path: &str| {
+                    if !json {
+                        eprintln!("  Deleting {}", path);
+                    }
+                };
+                match vol.delete_macos_metadata(&found, Some(&progress)) {
+                    Ok((files, dirs, bytes)) => {
+                        vol.flush().unwrap();
+                        let msg = format!(
+                            "Removed {} file(s), {} dir(s), freed {}",
+                            files,
+                            dirs,
+                            format_size(bytes)
+                        );
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "success": true,
+                                    "message": msg,
+                                    "files_deleted": files,
+                                    "dirs_deleted": dirs,
+                                    "bytes_freed": bytes
+                                })
+                            );
+                        } else {
+                            println!("{}", msg);
+                        }
+                    }
+                    Err(e) => {
+                        if json {
+                            println!("{}", serde_json::json!({"error": format!("{}", e)}));
+                            process::exit(0);
+                        }
+                        eprintln!("Error: {}", e);
+                        process::exit(1);
+                    }
                 }
             }
         }
