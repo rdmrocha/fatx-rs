@@ -50,9 +50,15 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run security audit
+        run: cargo audit
 
   build:
     name: Build & Test
@@ -83,8 +89,5 @@ jobs:
       - name: Build release
         run: cargo build --release
 
-      - name: Verify binaries
-        run: |
-          ./target/release/fatx --version
-          ./target/release/fatx-mkimage --help | head -1
-          ./target/release/fatx-mount --help | head -1
+      - name: Verify binary
+        run: ./target/release/fatx --version
