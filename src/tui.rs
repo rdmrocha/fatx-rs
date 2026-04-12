@@ -1261,14 +1261,14 @@ fn ui(frame: &mut Frame, app: &mut App) {
         let input_bar = Paragraph::new(input_text)
             .style(
                 Style::default()
-                    .fg(Color::Yellow)
-                    .bg(Color::Rgb(30, 30, 50)),
+                    .fg(Color::LightYellow)
+                    .bg(Color::Blue),
             )
             .block(
                 Block::default()
                     .title(" Input (Enter to confirm, Esc to cancel) ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
+                    .border_style(Style::default().fg(Color::LightYellow)),
             );
         frame.render_widget(input_bar, chunks[2]);
 
