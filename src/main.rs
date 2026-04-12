@@ -610,11 +610,18 @@ fn interactive_mode() {
                             println!("  Found:");
                             for entry in &found {
                                 let kind = if entry.is_dir { "dir " } else { "file" };
-                                println!("    [{}] {} ({})", kind, entry.path, format_size(entry.size));
+                                println!(
+                                    "    [{}] {} ({})",
+                                    kind,
+                                    entry.path,
+                                    format_size(entry.size)
+                                );
                             }
                             println!(
                                 "\n  {} file(s), {} dir(s), {} to free",
-                                file_count, dir_count, format_size(total_bytes)
+                                file_count,
+                                dir_count,
+                                format_size(total_bytes)
                             );
                             print!("\n  Delete all? (y/n): ");
                             io::stdout().flush().unwrap();
@@ -628,7 +635,9 @@ fn interactive_mode() {
                                         let _ = vol.flush();
                                         println!(
                                             "\n  Removed {} file(s), {} dir(s), freed {}",
-                                            files, dirs, format_size(bytes)
+                                            files,
+                                            dirs,
+                                            format_size(bytes)
                                         );
                                     }
                                     Err(e) => eprintln!("  Error during cleanup: {}", e),

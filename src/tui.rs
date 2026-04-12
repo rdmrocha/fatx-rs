@@ -617,22 +617,20 @@ fn io_worker(
                 }
             },
 
-            IoCmd::ScanCleanup { path } => {
-                match vol.scan_macos_metadata_from(&path) {
-                    Ok(found) => {
-                        let entries: Vec<(String, bool, u64)> = found
-                            .iter()
-                            .map(|e| (e.path.clone(), e.is_dir, e.size))
-                            .collect();
-                        let _ = resp_tx.send(IoResp::CleanupScanResult { entries });
-                    }
-                    Err(e) => {
-                        let _ = resp_tx.send(IoResp::Error {
-                            message: format!("Scan error: {}", e),
-                        });
-                    }
+            IoCmd::ScanCleanup { path } => match vol.scan_macos_metadata_from(&path) {
+                Ok(found) => {
+                    let entries: Vec<(String, bool, u64)> = found
+                        .iter()
+                        .map(|e| (e.path.clone(), e.is_dir, e.size))
+                        .collect();
+                    let _ = resp_tx.send(IoResp::CleanupScanResult { entries });
                 }
-            }
+                Err(e) => {
+                    let _ = resp_tx.send(IoResp::Error {
+                        message: format!("Scan error: {}", e),
+                    });
+                }
+            },
 
             IoCmd::DeleteCleanup { paths } => {
                 let mut files = 0usize;
@@ -892,7 +890,11 @@ fn handle_io_response(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, resp: IoResp)
                 let preview = if names.len() <= 5 {
                     names.join(", ")
                 } else {
-                    format!("{}, ... and {} more", names[..5].join(", "), names.len() - 5)
+                    format!(
+                        "{}, ... and {} more",
+                        names[..5].join(", "),
+                        names.len() - 5
+                    )
                 };
                 app.pending_cleanup = entries;
                 app.input_prompt = format!(
@@ -1260,11 +1262,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
     if app.input_mode != InputMode::Normal {
         let input_text = format!(" {} {}", app.input_prompt, app.input_buffer);
         let input_bar = Paragraph::new(input_text)
-            .style(
-                Style::default()
-                    .fg(Color::LightYellow)
-                    .bg(Color::Blue),
-            )
+            .style(Style::default().fg(Color::LightYellow).bg(Color::Blue))
             .block(
                 Block::default()
                     .title(" Input (Enter to confirm, Esc to cancel) ")

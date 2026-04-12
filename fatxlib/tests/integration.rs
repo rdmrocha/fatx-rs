@@ -879,7 +879,12 @@ fn test_copy_from_host_skips_macos_metadata() {
     let entries = vol.read_directory(dest.first_cluster).unwrap();
     let names: Vec<String> = entries.iter().map(|e| e.filename()).collect();
 
-    assert_eq!(names, vec!["game.bin"], "only real files should be copied, got: {:?}", names);
+    assert_eq!(
+        names,
+        vec!["game.bin"],
+        "only real files should be copied, got: {:?}",
+        names
+    );
 }
 
 /// is_macos_metadata should match the expected patterns.
@@ -908,10 +913,14 @@ fn test_scan_and_delete_macos_metadata() {
 
     // Create a mix of real files and macOS junk
     vol.create_directory("/Content").expect("mkdir");
-    vol.create_file("/Content/game.bin", b"real data").expect("create game");
-    vol.create_file("/Content/.DS_Store", b"junk").expect("create ds_store");
-    vol.create_file("/Content/._game.bin", b"resource fork").expect("create resource");
-    vol.create_file("/.DS_Store", b"root junk").expect("create root ds_store");
+    vol.create_file("/Content/game.bin", b"real data")
+        .expect("create game");
+    vol.create_file("/Content/.DS_Store", b"junk")
+        .expect("create ds_store");
+    vol.create_file("/Content/._game.bin", b"resource fork")
+        .expect("create resource");
+    vol.create_file("/.DS_Store", b"root junk")
+        .expect("create root ds_store");
 
     // Scan first — non-destructive
     let found = vol.scan_macos_metadata().expect("scan");
