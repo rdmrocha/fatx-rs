@@ -1611,6 +1611,93 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         Ok(())
     }
 
+    /// Scan the entire volume for macOS metadata files without deleting anything.
+    /// Returns a list of matching entries.
+    pub fn scan_macos_metadata(&mut self) -> Result<Vec<MacosMetadataEntry>> {
+        self.scan_macos_metadata_from("/")
+    }
+
+    /// Scan from a specific directory path for macOS metadata files.
+    pub fn scan_macos_metadata_from(&mut self, path: &str) -> Result<Vec<MacosMetadataEntry>> {
+        let entry = self.resolve_path(path)?;
+        if !entry.is_directory() {
+            return Err(FatxError::NotADirectory(path.to_string()));
+        }
+        let mut found = Vec::new();
+        self.scan_macos_metadata_inner(path, entry.first_cluster, &mut found)?;
+        Ok(found)
+    }
+
+    fn scan_macos_metadata_inner(
+        &mut self,
+        dir_path: &str,
+        dir_cluster: u32,
+        found: &mut Vec<MacosMetadataEntry>,
+    ) -> Result<()> {
+        let entries = self.read_directory(dir_cluster)?;
+
+        // Collect to avoid borrow conflict with recursive &mut self calls
+        let children: Vec<(String, bool, u32, u32)> = entries
+            .iter()
+            .map(|e| (e.filename(), e.is_directory(), e.first_cluster, e.file_size))
+            .collect();
+
+        for (name, is_dir, first_cluster, file_size) in children {
+            let child_path = if dir_path == "/" {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", dir_path, name)
+            };
+
+            if crate::types::is_macos_metadata(&name) {
+                found.push(MacosMetadataEntry {
+                    path: child_path,
+                    is_dir,
+                    size: file_size as u64,
+                });
+                // Don't recurse into metadata dirs — they'll be deleted whole
+            } else if is_dir {
+                self.scan_macos_metadata_inner(&child_path, first_cluster, found)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete all entries from a previous `scan_macos_metadata` result.
+    /// Returns (files_deleted, dirs_deleted, bytes_freed).
+    pub fn delete_macos_metadata(
+        &mut self,
+        entries: &[MacosMetadataEntry],
+        progress: Option<&dyn Fn(&str)>,
+    ) -> Result<(usize, usize, u64)> {
+        let mut files_deleted = 0usize;
+        let mut dirs_deleted = 0usize;
+        let mut bytes_freed = 0u64;
+
+        for entry in entries {
+            if let Some(cb) = &progress {
+                cb(&entry.path);
+            }
+            if entry.is_dir {
+                if let Err(e) = self.delete_recursive(&entry.path) {
+                    warn!("cleanup: failed to delete dir '{}': {}", entry.path, e);
+                    continue;
+                }
+                dirs_deleted += 1;
+            } else {
+                if let Err(e) = self.delete(&entry.path) {
+                    warn!("cleanup: failed to delete '{}': {}", entry.path, e);
+                    continue;
+                }
+                files_deleted += 1;
+                bytes_freed += entry.size;
+            }
+        }
+
+        Ok((files_deleted, dirs_deleted, bytes_freed))
+    }
+
     /// Recursively copy a local directory tree into the FATX volume.
     /// Opens volume once and writes all files/dirs in a single session.
     pub fn copy_from_host(
@@ -1715,6 +1802,13 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             let entry = entry.map_err(|e| FatxError::Io(std::io::Error::other(e.to_string())))?;
             let local_child = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
+
+            // Skip macOS metadata files — meaningless on Xbox, wastes clusters
+            if crate::types::is_macos_metadata(&name) {
+                info!("Skipping macOS metadata: {}", name);
+                continue;
+            }
+
             let fatx_child = if dest_path == "/" {
                 format!("/{}", name)
             } else {
@@ -2051,6 +2145,17 @@ impl FatxVolume<File> {
 
         Ok(data)
     }
+}
+
+/// A macOS metadata entry found by `scan_macos_metadata`.
+#[derive(Debug)]
+pub struct MacosMetadataEntry {
+    /// FATX path (e.g., "/Content/.DS_Store")
+    pub path: String,
+    /// Whether this is a directory (.Spotlight-V100, .Trashes, .fseventsd)
+    pub is_dir: bool,
+    /// File size in bytes (0 for directories)
+    pub size: u64,
 }
 
 /// Volume usage statistics.

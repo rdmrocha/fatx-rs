@@ -19,13 +19,16 @@ Both FAT16 and FAT32 entry sizes are handled automatically based on partition si
 
 **File Operations**
 - Full read/write support: list, read, write, create directories, delete, rename, recursive delete
+- Recursive directory copy with automatic macOS metadata filtering
 - Automatic partition detection at standard Xbox and Xbox 360 offsets
 - Interactive guided mode when run with no arguments
-- TUI file browser for navigating volumes visually
+- TUI file browser for navigating, uploading, downloading, and cleaning up volumes
 - JSON output mode (`--json`) for scripting and automation
+- macOS metadata cleanup command (scan + delete `.DS_Store`, `._*`, etc.)
 
 **Finder Mount**
 - Mount FATX volumes in Finder via a local NFS server
+- Guided mount: `sudo fatx mount` with no arguments detects drives and mounts automatically
 - Read and write files through Finder drag-and-drop
 - Clean unmount on Ctrl+C with signal handling
 
@@ -155,6 +158,8 @@ sudo fatx rmr /dev/rdisk4 --partition "360 Data" /Content
 sudo fatx copy /dev/rdisk4 --partition "360 Data" --from /path/to/local/folder --to /DestFolder
 ```
 
+macOS metadata files (`.DS_Store`, `._*`, `.Spotlight-V100`, `.Trashes`, `.fseventsd`) are automatically skipped during copy.
+
 ### Rename
 
 ```bash
@@ -171,15 +176,22 @@ sudo fatx info /dev/rdisk4 --partition "360 Data" --json
 ### TUI File Browser
 
 ```bash
+# Guided mode — detects disks and partitions automatically
+sudo fatx browse
+
+# Browse a specific partition
 sudo fatx browse /dev/rdisk4 --partition "360 Data"
 ```
 
-Interactive terminal UI for navigating, downloading, and uploading files.
+Interactive terminal UI for navigating, downloading, uploading, and cleaning up files. Press `c` to scan and remove macOS metadata from the current directory.
 
 ### Mount in Finder
 
 ```bash
-# Start NFS server and mount in Finder
+# Guided mode — detects disks, scans partitions, mounts automatically
+sudo fatx mount
+
+# Mount a specific partition
 sudo fatx mount /dev/rdisk4 --partition "360 Data" -v --mount
 
 # Start NFS server only (no Finder mount)
@@ -193,6 +205,20 @@ sudo fatx mount --cleanup
 ```
 
 The mount uses a local NFSv3 server with `soft,intr` options. Ctrl+C cleanly unmounts before exiting. The initial FAT load for large drives (1TB+) takes a few seconds over USB — this is normal.
+
+### Clean Up macOS Metadata
+
+Remove `.DS_Store`, `._*` resource forks, `.Spotlight-V100`, `.Trashes`, and `.fseventsd` from the volume:
+
+```bash
+# Preview what would be deleted
+sudo fatx cleanup /dev/rdisk4 --partition "360 Data" --dry-run
+
+# Delete them
+sudo fatx cleanup /dev/rdisk4 --partition "360 Data"
+```
+
+In interactive mode (option 10), the cleanup scans first and asks for confirmation before deleting.
 
 ### Create Test Images
 

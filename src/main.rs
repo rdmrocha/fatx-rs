@@ -151,7 +151,8 @@ struct JsonSuccess {
 enum Commands {
     /// Interactive TUI file browser — navigate, download, and upload files
     Browse {
-        device: PathBuf,
+        /// Device or disk image (omit for guided selection)
+        device: Option<PathBuf>,
         #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
         offset: u64,
         #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
@@ -290,7 +291,19 @@ enum Commands {
         #[arg(short, long, default_value = "512")]
         count: usize,
     },
-    /// Mount a FATX volume via NFS (shows in Finder)
+    /// Remove macOS metadata files (.DS_Store, ._ files, etc.) from the volume
+    Cleanup {
+        device: PathBuf,
+        /// Show what would be deleted without actually deleting
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
+        offset: u64,
+        #[arg(long, value_parser = parse_hex_or_dec, default_value = "0")]
+        size: u64,
+        #[arg(long)]
+        partition: Option<String>,
+    },
     /// Mount a FATX volume via NFS server (shows in Finder)
     Mount(mount::MountArgs),
     /// Create a blank FATX/XTAF disk image for testing
@@ -301,14 +314,18 @@ enum Commands {
 // Interactive mode
 // ===========================================================================
 
-fn interactive_mode() {
-    println!();
-    println!("========================================");
-    println!("  fatx — Xbox FATX filesystem tool  ");
-    println!("========================================");
-    println!();
+/// Result of the guided partition selection flow.
+struct SelectedPartition {
+    device_path: PathBuf,
+    partition_name: String,
+    offset: u64,
+    size: u64,
+}
 
-    // Step 1: Check for sudo
+/// Interactive device detection + partition scanning + selection.
+/// Used by both `interactive_mode` and guided `fatx mount`.
+fn guided_partition_selection() -> Option<SelectedPartition> {
+    // Check for sudo
     if !running_as_root() {
         println!("[!] You're not running as root. Raw device access requires sudo.");
         println!("    Re-run with: sudo fatx");
@@ -318,12 +335,12 @@ fn interactive_mode() {
         let ans = read_line();
         if !ans.starts_with('y') && !ans.starts_with('Y') {
             println!("Exiting.");
-            return;
+            return None;
         }
         println!();
     }
 
-    // Step 2: Detect disks
+    // Detect disks
     println!("[1/3] Detecting available disks...\n");
     let disks = detect_macos_disks();
     if disks.is_empty() {
@@ -347,7 +364,6 @@ fn interactive_mode() {
         let input = read_line();
         if let Ok(n) = input.parse::<usize>() {
             if n >= 1 && n <= disks.len() {
-                // Convert /dev/diskN to /dev/rdiskN for raw access
                 let path = &disks[n - 1];
                 let raw = path.replace("/dev/disk", "/dev/rdisk");
                 break PathBuf::from(raw);
@@ -363,7 +379,7 @@ fn interactive_mode() {
 
     println!("\nUsing device: {}\n", device_path.display());
 
-    // Step 3: Unmount if it's a real device
+    // Unmount if it's a real device
     if device_path.to_string_lossy().contains("/dev/") {
         let disk_path = device_path
             .to_string_lossy()
@@ -381,7 +397,7 @@ fn interactive_mode() {
         println!("[2/3] Skipping unmount (not a block device).\n");
     }
 
-    // Step 4: Scan for FATX partitions
+    // Scan for FATX partitions
     println!("[3/3] Scanning for FATX partitions...\n");
 
     let mut file = match OpenOptions::new().read(true).write(true).open(&device_path) {
@@ -394,11 +410,10 @@ fn interactive_mode() {
             } else if e.kind() == io::ErrorKind::PermissionDenied {
                 eprintln!("Hint: Run with sudo for raw device access.");
             }
-            return;
+            return None;
         }
     };
 
-    // Try reading FATX/XTAF magic directly at offset 0 first
     let direct_fatx = {
         let mut magic = [0u8; 4];
         file.seek(SeekFrom::Start(0)).ok();
@@ -428,13 +443,13 @@ fn interactive_mode() {
                         "  You can try a deep scan with: fatx scan {} --deep\n",
                         device_path.display()
                     );
-                    return;
+                    return None;
                 }
                 valid
             }
             Err(e) => {
                 eprintln!("  Error scanning: {}", e);
-                return;
+                return None;
             }
         }
     };
@@ -470,12 +485,32 @@ fn interactive_mode() {
         }
     };
 
-    let part_offset = selected.offset;
-    let part_size = selected.size;
+    Some(SelectedPartition {
+        device_path,
+        partition_name: selected.name.clone(),
+        offset: selected.offset,
+        size: selected.size,
+    })
+}
+
+fn interactive_mode() {
+    println!();
+    println!("========================================");
+    println!("  fatx — Xbox FATX filesystem tool  ");
+    println!("========================================");
+    println!();
+
+    let sel = match guided_partition_selection() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let part_offset = sel.offset;
+    let part_size = sel.size;
+    let device_path = &sel.device_path;
 
     // Open the volume
-    drop(file);
-    let file = match OpenOptions::new().read(true).write(true).open(&device_path) {
+    let file = match OpenOptions::new().read(true).write(true).open(device_path) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error reopening device: {}", e);
@@ -503,11 +538,10 @@ fn interactive_mode() {
     vol.configure_device(raw_fd);
 
     println!(
-        "Volume opened: {} ({}, {}, {})",
-        selected.name,
+        "Volume opened: {} ({}, {})",
+        sel.partition_name,
         vol.superblock.magic_str(),
         vol.fat_type,
-        selected.generation
     );
     println!(
         "  Cluster size: {}, Total clusters: {}\n",
@@ -530,6 +564,7 @@ fn interactive_mode() {
         println!("  7) rename    — Rename a file or directory");
         println!("  8) info      — Volume statistics");
         println!("  9) hexdump   — Raw hex dump");
+        println!(" 10) cleanup   — Remove macOS metadata (.DS_Store, ._ files, etc.)");
         println!("  0) quit");
         println!();
         print!("fatx> ");
@@ -565,7 +600,60 @@ fn interactive_mode() {
                 interactive_info(&mut vol);
             }
             "9" | "hexdump" | "hex" => {
-                interactive_hexdump(&device_path);
+                interactive_hexdump(device_path);
+            }
+            "10" | "cleanup" => {
+                println!("  Scanning for macOS metadata files...\n");
+                match vol.scan_macos_metadata() {
+                    Ok(found) => {
+                        if found.is_empty() {
+                            println!("  No macOS metadata found.");
+                        } else {
+                            let total_bytes: u64 = found.iter().map(|e| e.size).sum();
+                            let file_count = found.iter().filter(|e| !e.is_dir).count();
+                            let dir_count = found.iter().filter(|e| e.is_dir).count();
+                            println!("  Found:");
+                            for entry in &found {
+                                let kind = if entry.is_dir { "dir " } else { "file" };
+                                println!(
+                                    "    [{}] {} ({})",
+                                    kind,
+                                    entry.path,
+                                    format_size(entry.size)
+                                );
+                            }
+                            println!(
+                                "\n  {} file(s), {} dir(s), {} to free",
+                                file_count,
+                                dir_count,
+                                format_size(total_bytes)
+                            );
+                            print!("\n  Delete all? (y/n): ");
+                            io::stdout().flush().unwrap();
+                            let ans = read_line();
+                            if ans.trim().starts_with('y') || ans.trim().starts_with('Y') {
+                                let progress = |path: &str| {
+                                    println!("  Deleting {}", path);
+                                };
+                                match vol.delete_macos_metadata(&found, Some(&progress)) {
+                                    Ok((files, dirs, bytes)) => {
+                                        let _ = vol.flush();
+                                        println!(
+                                            "\n  Removed {} file(s), {} dir(s), freed {}",
+                                            files,
+                                            dirs,
+                                            format_size(bytes)
+                                        );
+                                    }
+                                    Err(e) => eprintln!("  Error during cleanup: {}", e),
+                                }
+                            } else {
+                                println!("  Cancelled.");
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("  Error scanning: {}", e),
+                }
             }
             "0" | "quit" | "exit" | "q" => {
                 println!("Flushing and exiting...");
@@ -1484,6 +1572,20 @@ fn main() {
             size,
             partition,
         }) => {
+            let (device, partition) = if let Some(dev) = device {
+                (dev, partition)
+            } else {
+                // Guided mode
+                println!();
+                println!("========================================");
+                println!("  fatx browse — guided setup");
+                println!("========================================");
+                println!();
+                match guided_partition_selection() {
+                    Some(sel) => (sel.device_path, Some(sel.partition_name)),
+                    None => process::exit(0),
+                }
+            };
             let part_name = partition
                 .clone()
                 .unwrap_or_else(|| "FATX Volume".to_string());
@@ -2120,7 +2222,125 @@ fn main() {
             }
         }
 
-        Some(Commands::Mount(args)) => {
+        Some(Commands::Cleanup {
+            device,
+            dry_run,
+            offset,
+            size,
+            partition,
+        }) => {
+            let mut vol = open_volume(&device, &partition, offset, size);
+            let found = vol.scan_macos_metadata().unwrap_or_else(|e| {
+                if json {
+                    println!("{}", serde_json::json!({"error": format!("{}", e)}));
+                    process::exit(0);
+                }
+                eprintln!("Error scanning: {}", e);
+                process::exit(1);
+            });
+
+            if found.is_empty() {
+                let msg = "No macOS metadata found";
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"success": true, "message": msg, "files": 0, "dirs": 0, "bytes": 0})
+                    );
+                } else {
+                    println!("{}", msg);
+                }
+            } else if dry_run {
+                let total_bytes: u64 = found.iter().map(|e| e.size).sum();
+                let file_count = found.iter().filter(|e| !e.is_dir).count();
+                let dir_count = found.iter().filter(|e| e.is_dir).count();
+                if !json {
+                    println!("Would delete:");
+                    for entry in &found {
+                        let kind = if entry.is_dir { "dir " } else { "file" };
+                        println!("  [{}] {} ({})", kind, entry.path, format_size(entry.size));
+                    }
+                    println!(
+                        "\n{} file(s), {} dir(s), {} would be freed",
+                        file_count,
+                        dir_count,
+                        format_size(total_bytes)
+                    );
+                } else {
+                    let paths: Vec<&str> = found.iter().map(|e| e.path.as_str()).collect();
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "dry_run": true,
+                            "files": file_count,
+                            "dirs": dir_count,
+                            "bytes": total_bytes,
+                            "entries": paths
+                        })
+                    );
+                }
+            } else {
+                let progress = |path: &str| {
+                    if !json {
+                        eprintln!("  Deleting {}", path);
+                    }
+                };
+                match vol.delete_macos_metadata(&found, Some(&progress)) {
+                    Ok((files, dirs, bytes)) => {
+                        vol.flush().unwrap();
+                        let msg = format!(
+                            "Removed {} file(s), {} dir(s), freed {}",
+                            files,
+                            dirs,
+                            format_size(bytes)
+                        );
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "success": true,
+                                    "message": msg,
+                                    "files_deleted": files,
+                                    "dirs_deleted": dirs,
+                                    "bytes_freed": bytes
+                                })
+                            );
+                        } else {
+                            println!("{}", msg);
+                        }
+                    }
+                    Err(e) => {
+                        if json {
+                            println!("{}", serde_json::json!({"error": format!("{}", e)}));
+                            process::exit(0);
+                        }
+                        eprintln!("Error: {}", e);
+                        process::exit(1);
+                    }
+                }
+            }
+        }
+
+        Some(Commands::Mount(mut args)) => {
+            // Guided mode: no device specified and not a cleanup run
+            if args.device.is_none() && !args.cleanup {
+                println!();
+                println!("========================================");
+                println!("  fatx mount — guided setup");
+                println!("========================================");
+                println!();
+
+                match guided_partition_selection() {
+                    Some(sel) => {
+                        args.device = Some(sel.device_path);
+                        args.partition = Some(sel.partition_name);
+                        // Auto-enable mount — the user chose guided mode, they want Finder access
+                        args.mount = true;
+                    }
+                    None => {
+                        process::exit(0);
+                    }
+                }
+            }
             mount::run(args);
         }
 

@@ -35,7 +35,7 @@ Rust toolkit for reading, writing, and mounting FATX/XTAF file systems on Xbox/X
 - Uses `tokio::task::spawn_blocking` for all FATX volume I/O — blocking USB reads must NOT run on the async event loop or the NFS server freezes
 - File data cache (`file_cache`) and directory cache (`dir_cache`) avoid redundant USB reads. NFS reads come in 128KB chunks; without caching, each chunk re-reads the entire file.
 - Write buffering: NFS writes accumulate in `dirty_files` HashMap in memory (sub-millisecond). A periodic flush task (every 5s) batch-writes dirty files to disk and flushes the FAT. This prevents the catastrophic slowdown where each 128KB NFS chunk triggered a full file delete+recreate+231MB FAT flush.
-- macOS metadata files (.DS_Store, ._, .Spotlight-V100, .Trashes, .fseventsd) are allowed through (user decision: "just allow mac to have dsstore files, if it proves to be a problem we will address it later")
+- macOS metadata files (.DS_Store, ._, .Spotlight-V100, .Trashes, .fseventsd) are allowed through the NFS mount (Finder manages its own metadata). CLI `copy` and TUI upload automatically skip these files. The `fatx cleanup` command can scan and remove them from existing volumes.
 - Mount options include `soft,intr,retrans=2,timeo=10` to prevent macOS from hanging on stale NFS mounts
 - **CRITICAL**: Shutdown must unmount BEFORE stopping the NFS server. If the server dies first, umount hangs, Finder freezes, and the user may need to reboot. The signal handler on a dedicated thread handles this.
 - Auto-mount is OFF by default (`--mount` to enable). This prevents stale mount disasters during development.

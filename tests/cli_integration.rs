@@ -759,3 +759,123 @@ fn test_cli_scan_image() {
     // but should not crash
     let _ = output.status;
 }
+
+// ===========================================================================
+// fatx cleanup
+// ===========================================================================
+
+#[test]
+fn test_cli_cleanup_dry_run_finds_ds_store() {
+    let (_tmp, img) = create_test_image(4, false);
+
+    let input_dir = TempDir::new().unwrap();
+    let ds_store = input_dir.path().join(".DS_Store");
+    std::fs::write(&ds_store, b"macos junk").unwrap();
+    let real_file = input_dir.path().join("game.bin");
+    std::fs::write(&real_file, b"real data").unwrap();
+
+    fatx_bin()
+        .args([
+            "write",
+            img.to_str().unwrap(),
+            "/.DS_Store",
+            "--input",
+            ds_store.to_str().unwrap(),
+        ])
+        .output()
+        .expect("write .DS_Store");
+
+    fatx_bin()
+        .args([
+            "write",
+            img.to_str().unwrap(),
+            "/game.bin",
+            "--input",
+            real_file.to_str().unwrap(),
+        ])
+        .output()
+        .expect("write game.bin");
+
+    let output = fatx_bin()
+        .args(["cleanup", img.to_str().unwrap(), "--dry-run"])
+        .output()
+        .expect("run fatx cleanup --dry-run");
+
+    assert!(
+        output.status.success(),
+        "cleanup --dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(".DS_Store"),
+        "dry-run should list .DS_Store, got: {}",
+        stdout
+    );
+
+    // Verify .DS_Store still exists after dry-run
+    let ls_output = fatx_bin()
+        .args(["ls", img.to_str().unwrap(), "/"])
+        .output()
+        .expect("ls");
+    let ls_stdout = String::from_utf8_lossy(&ls_output.stdout);
+    assert!(
+        ls_stdout.contains(".DS_Store"),
+        ".DS_Store should still exist after dry-run"
+    );
+    assert!(
+        ls_stdout.contains("game.bin"),
+        "game.bin should still exist"
+    );
+}
+
+#[test]
+fn test_cli_copy_skips_macos_metadata() {
+    let (_tmp, img) = create_test_image(16, false);
+
+    let input_dir = TempDir::new().unwrap();
+    let src = input_dir.path().join("GameDir");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("game.bin"), b"real game data").unwrap();
+    std::fs::write(src.join("save.dat"), b"save file").unwrap();
+    std::fs::write(src.join(".DS_Store"), b"macos junk").unwrap();
+    std::fs::write(src.join("._game.bin"), b"resource fork").unwrap();
+    std::fs::create_dir(src.join(".Spotlight-V100")).unwrap();
+    std::fs::write(src.join(".Spotlight-V100").join("store.db"), b"spotlight").unwrap();
+
+    let output = fatx_bin()
+        .args([
+            "copy",
+            img.to_str().unwrap(),
+            "--from",
+            src.to_str().unwrap(),
+            "--to",
+            "/GameDir",
+        ])
+        .output()
+        .expect("run fatx copy");
+
+    assert!(
+        output.status.success(),
+        "copy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let ls_output = fatx_bin()
+        .args(["ls", img.to_str().unwrap(), "/GameDir"])
+        .output()
+        .expect("ls GameDir");
+    assert!(ls_output.status.success());
+    let stdout = String::from_utf8_lossy(&ls_output.stdout);
+    assert!(stdout.contains("game.bin"), "should have game.bin");
+    assert!(stdout.contains("save.dat"), "should have save.dat");
+    assert!(!stdout.contains(".DS_Store"), ".DS_Store should be skipped");
+    assert!(
+        !stdout.contains("._game.bin"),
+        "._game.bin should be skipped"
+    );
+    assert!(
+        !stdout.contains(".Spotlight"),
+        ".Spotlight-V100 should be skipped"
+    );
+}
