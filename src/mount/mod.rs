@@ -3,6 +3,7 @@
 //! Starts a localhost NFSv3 server backed by a FATX volume, then mounts it
 //! so it appears as a regular volume in Finder.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
@@ -631,26 +632,51 @@ impl NFSFileSystem for FatxNfs {
             entries.into_iter().find(|e| e.first_cluster == cluster)
         };
         let entry = entry.ok_or(nfsstat3::NFS3ERR_NOENT)?;
+
+        let needs_seed = {
+            let dirty = self.dirty_files.lock();
+            dirty.get(&cluster).is_none()
+        };
+
+        let prefetched_seed = if needs_seed {
+            if let Some(cached) = self.file_cache.get(&cluster) {
+                Some(cached.to_vec())
+            } else {
+                let vol = Arc::clone(&self.vol);
+                let entry = entry.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        let mut vol = vol.write();
+                        vol.read_file(&entry).map_err(|e| {
+                            warn!("seed read for cluster {} failed: {}", entry.first_cluster, e);
+                            nfsstat3::NFS3ERR_IO
+                        })
+                    })
+                    .await
+                    .unwrap_or(Err(nfsstat3::NFS3ERR_IO))?,
+                )
+            }
+        } else {
+            None
+        };
+
         // Buffer the write in memory — NO disk I/O here.
         // The periodic flush task will write dirty files to disk.
         {
             let mut dirty = self.dirty_files.lock();
-            let buf = dirty.entry(cluster).or_insert_with(|| {
-                // First write to this file — seed from file_cache or empty
-                let cached = self.file_cache.get(&cluster);
-                let existing = if let Some(c) = cached {
-                    c.to_vec()
-                } else {
-                    // Need to read from disk (blocking) — but only once per file
-                    let mut vol = self.vol.write();
-                    vol.read_file(&entry).unwrap_or_default()
-                };
-                DirtyFileState {
+            let buf = match dirty.entry(cluster) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(DirtyFileState {
                     parent_cluster,
                     first_cluster: cluster,
-                    data: existing,
-                }
-            });
+                    // We intentionally re-check here after prefetching outside the lock.
+                    // Another writer may have inserted the dirty buffer while we were
+                    // reading from cache/disk, in which case the Occupied arm wins and
+                    // this prefetched seed is discarded instead of clobbering newer data.
+                    data: prefetched_seed
+                        .expect("prefetched seed must exist when inserting dirty buffer"),
+                }),
+            };
 
             let write_end = offset as usize + data.len();
             if write_end > buf.data.len() {
@@ -2044,6 +2070,7 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
 mod tests {
     use super::*;
     use crate::mkimage::{run as run_mkimage, MkimageArgs};
+    use fatxlib::FatEntry;
     use std::fs::OpenOptions;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -2313,6 +2340,55 @@ mod tests {
         assert_eq!(
             vol.read_file_by_path("/exists.bin").expect("read existing file"),
             b"original"
+        );
+    }
+
+    #[test]
+    fn test_write_seeds_from_disk_on_cache_miss() {
+        let (_tmp, _image_path, fs) = create_test_nfs();
+
+        let file_id = {
+            let mut vol = fs.vol.write();
+            vol.create_file("/seed.bin", b"abcdef").expect("create seed file");
+            let entry = vol.resolve_path("/seed.bin").expect("resolve seed file");
+            fs.inode_parents
+                .write()
+                .insert(entry.first_cluster, (FIRST_CLUSTER, "seed.bin".to_string()));
+            cluster_to_id(entry.first_cluster)
+        };
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let attr = rt.block_on(async { fs.write(file_id, 0, b"ZZ").await });
+        assert!(attr.is_ok(), "write should succeed on cache miss");
+
+        let dirty = fs.dirty_files.lock();
+        let state = dirty.get(&id_to_cluster(file_id)).expect("dirty buffer");
+        assert_eq!(state.data, b"ZZcdef");
+    }
+
+    #[test]
+    fn test_write_returns_io_if_seed_read_fails() {
+        let (_tmp, _image_path, fs) = create_test_nfs();
+
+        let file_id = {
+            let mut vol = fs.vol.write();
+            vol.create_file("/broken.bin", b"abcdef")
+                .expect("create broken file");
+            let entry = vol.resolve_path("/broken.bin").expect("resolve broken file");
+            vol.write_fat_entry(entry.first_cluster, FatEntry::Free)
+                .expect("corrupt chain");
+            fs.inode_parents
+                .write()
+                .insert(entry.first_cluster, (FIRST_CLUSTER, "broken.bin".to_string()));
+            cluster_to_id(entry.first_cluster)
+        };
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let result = rt.block_on(async { fs.write(file_id, 0, b"ZZ").await });
+        assert!(matches!(result, Err(nfsstat3::NFS3ERR_IO)));
+        assert!(
+            !fs.dirty_files.lock().contains_key(&id_to_cluster(file_id)),
+            "failed seed read must not create a dirty buffer"
         );
     }
 }
