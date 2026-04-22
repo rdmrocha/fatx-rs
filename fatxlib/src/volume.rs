@@ -74,7 +74,8 @@ struct CopyFromHostState<'a> {
 #[doc(hidden)]
 #[must_use = "WriteSession must be commit()'d or cancel()'d"]
 pub struct WriteSession {
-    path: String,
+    parent_cluster: u32,
+    first_cluster: u32,
     old_count: usize,
     chain: Vec<u32>,
     new_size: usize,
@@ -91,8 +92,8 @@ impl Drop for WriteSession {
     fn drop(&mut self) {
         if !self.finalized {
             warn!(
-                "WriteSession for '{}' dropped without commit/cancel; uncommitted FAT reservations may remain",
-                self.path
+                "WriteSession for cluster {} dropped without commit/cancel; uncommitted FAT reservations may remain",
+                self.first_cluster
             );
         }
     }
@@ -1426,11 +1427,13 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         Ok(())
     }
 
-    fn plan_write_in_place(&mut self, path: &str, new_size: usize) -> Result<(usize, Vec<u32>)> {
-        let target = self.resolve_path(path)?;
-
+    fn plan_write_in_place_for_entry(
+        &mut self,
+        target: &DirectoryEntry,
+        new_size: usize,
+    ) -> Result<(usize, Vec<u32>)> {
         if target.is_directory() {
-            return Err(FatxError::IsADirectory(path.to_string()));
+            return Err(FatxError::IsADirectory(target.filename()));
         }
 
         let cluster_size = self.superblock.cluster_size() as usize;
@@ -1500,6 +1503,27 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         Ok((old_count, planned_chain.into_iter().take(clusters_needed).collect()))
     }
 
+    fn find_entry_in_parent_by_cluster(
+        &mut self,
+        parent_cluster: u32,
+        first_cluster: u32,
+    ) -> Result<DirectoryEntry> {
+        let entries = if parent_cluster == FIRST_CLUSTER {
+            self.read_root_directory()?
+        } else {
+            self.read_directory(parent_cluster)?
+        };
+        entries
+            .into_iter()
+            .find(|entry| entry.first_cluster == first_cluster)
+            .ok_or_else(|| FatxError::FileNotFound(format!("cluster {}", first_cluster)))
+    }
+
+    fn plan_write_in_place(&mut self, path: &str, new_size: usize) -> Result<(usize, Vec<u32>)> {
+        let target = self.resolve_path(path)?;
+        self.plan_write_in_place_for_entry(&target, new_size)
+    }
+
     /// Prepare a file for in-place writing and return the target cluster chain
     /// that the caller should write payload data to.
     ///
@@ -1516,9 +1540,32 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
     #[doc(hidden)]
     pub fn begin_write_in_place(&mut self, path: &str, new_size: usize) -> Result<WriteSession> {
-        let (old_count, chain) = self.plan_write_in_place(path, new_size)?;
+        let (parent_path, _filename) = split_path(path);
+        let parent = self.resolve_path(parent_path)?;
+        let target = self.resolve_path(path)?;
+        let (old_count, chain) = self.plan_write_in_place_for_entry(&target, new_size)?;
         Ok(WriteSession {
-            path: path.to_string(),
+            parent_cluster: parent.first_cluster,
+            first_cluster: target.first_cluster,
+            old_count,
+            chain,
+            new_size,
+            finalized: false,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn begin_write_in_place_for_entry(
+        &mut self,
+        parent_cluster: u32,
+        first_cluster: u32,
+        new_size: usize,
+    ) -> Result<WriteSession> {
+        let target = self.find_entry_in_parent_by_cluster(parent_cluster, first_cluster)?;
+        let (old_count, chain) = self.plan_write_in_place_for_entry(&target, new_size)?;
+        Ok(WriteSession {
+            parent_cluster,
+            first_cluster,
             old_count,
             chain,
             new_size,
@@ -1528,20 +1575,20 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
     #[doc(hidden)]
     pub fn commit_write_session(&mut self, mut session: WriteSession) -> Result<()> {
-        let (parent_path, filename) = split_path(&session.path);
-        let parent = self.resolve_path(parent_path)?;
+        let target =
+            self.find_entry_in_parent_by_cluster(session.parent_cluster, session.first_cluster)?;
+        let filename = target.filename();
 
         let now = time::OffsetDateTime::now_utc();
         self.update_dirent_metadata(
-            parent.first_cluster,
-            filename,
+            session.parent_cluster,
+            &filename,
             session.new_size as u32,
             Some(now),
         )?;
 
         if session.chain.len() < session.old_count {
-            let target = self.resolve_path(&session.path)?;
-            let full_chain = self.read_chain(target.first_cluster)?;
+            let full_chain = self.read_chain(session.first_cluster)?;
             self.write_fat_entry(full_chain[session.chain.len() - 1], FatEntry::EndOfChain)?;
             for &cluster in full_chain.iter().skip(session.chain.len()) {
                 self.write_fat_entry(cluster, FatEntry::Free)?;
