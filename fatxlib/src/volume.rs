@@ -1609,22 +1609,6 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
     }
 
     #[doc(hidden)]
-    pub fn begin_write_in_place(&mut self, path: &str, new_size: usize) -> Result<WriteSession> {
-        let (parent_path, _filename) = split_path(path);
-        let parent = self.resolve_path(parent_path)?;
-        let target = self.resolve_path(path)?;
-        let (old_count, chain) = self.plan_write_in_place_for_entry(&target, new_size)?;
-        Ok(WriteSession {
-            parent_cluster: parent.first_cluster,
-            first_cluster: target.first_cluster,
-            old_count,
-            chain,
-            new_size,
-            finalized: false,
-        })
-    }
-
-    #[doc(hidden)]
     pub fn begin_write_in_place_for_entry(
         &mut self,
         parent_cluster: u32,

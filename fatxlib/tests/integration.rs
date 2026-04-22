@@ -1182,8 +1182,12 @@ fn test_begin_write_in_place_partial_extension_write_does_not_publish_size() {
         .expect("create");
 
     let cluster_size = vol.superblock.cluster_size() as usize;
+    let first_cluster = vol
+        .resolve_path("/session-grow.bin")
+        .expect("resolve grow session file")
+        .first_cluster;
     let session = vol
-        .begin_write_in_place("/session-grow.bin", cluster_size * 5)
+        .begin_write_in_place_for_entry(FIRST_CLUSTER, first_cluster, cluster_size * 5)
         .expect("begin session");
     assert_eq!(session.clusters().len(), 5, "grow session should reserve target chain");
 
@@ -1230,8 +1234,12 @@ fn test_cancel_write_session_releases_extension_and_preserves_visible_file() {
     let before = vol.stats().expect("stats before");
 
     let cluster_size = vol.superblock.cluster_size() as usize;
+    let first_cluster = vol
+        .resolve_path("/session-cancel.bin")
+        .expect("resolve cancel session file")
+        .first_cluster;
     let session = vol
-        .begin_write_in_place("/session-cancel.bin", cluster_size * 4)
+        .begin_write_in_place_for_entry(FIRST_CLUSTER, first_cluster, cluster_size * 4)
         .expect("begin session");
     let extension_cluster = session.clusters()[1];
     vol.write_cluster(extension_cluster, &vec![0x55; cluster_size])
