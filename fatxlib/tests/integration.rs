@@ -894,6 +894,61 @@ fn test_write_in_place_updates_dirent_size() {
 }
 
 #[test]
+fn test_read_chain_rejects_out_of_range_next_cluster() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    vol.create_file("/corrupt.bin", &[0xAA; 100]).expect("create");
+    let entry = vol.resolve_path("/corrupt.bin").expect("resolve");
+    let invalid_next = FIRST_CLUSTER + vol.total_clusters + 5;
+    vol.write_fat_entry(entry.first_cluster, FatEntry::Next(invalid_next))
+        .expect("corrupt fat entry");
+
+    let result = vol.read_chain(entry.first_cluster);
+    assert!(
+        matches!(result, Err(FatxError::CorruptChain(c)) if c == entry.first_cluster),
+        "expected corrupt chain for out-of-range next, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_read_chain_rejects_next_cluster_at_exact_upper_bound() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    vol.create_file("/boundary.bin", &[0xAB; 100]).expect("create");
+    let entry = vol.resolve_path("/boundary.bin").expect("resolve");
+    let invalid_next = FIRST_CLUSTER + vol.total_clusters;
+    vol.write_fat_entry(entry.first_cluster, FatEntry::Next(invalid_next))
+        .expect("corrupt fat entry");
+
+    let result = vol.read_chain(entry.first_cluster);
+    assert!(
+        matches!(result, Err(FatxError::CorruptChain(c)) if c == entry.first_cluster),
+        "expected corrupt chain for exact-boundary next, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_read_chain_rejects_cycle() {
+    let (_tmp, mut vol) = common::create_fatx_image(4);
+
+    let first = vol.allocate_chain(2).expect("allocate chain");
+    let chain = vol.read_chain(first).expect("read allocated chain");
+    assert_eq!(chain.len(), 2);
+
+    vol.write_fat_entry(chain[1], FatEntry::Next(chain[0]))
+        .expect("create cycle");
+
+    let result = vol.read_chain(first);
+    assert!(
+        matches!(result, Err(FatxError::CorruptChain(c)) if c == chain[0] || c == chain[1]),
+        "expected corrupt chain for cycle, got {:?}",
+        result
+    );
+}
+
+#[test]
 fn test_write_in_place_refreshes_write_and_access_timestamps() {
     let (_tmp, mut vol) = common::create_fatx_image(4);
 

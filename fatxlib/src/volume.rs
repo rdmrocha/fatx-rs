@@ -529,7 +529,21 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
     /// Read a single FAT entry for the given cluster.
     /// Takes `&self` — only reads from the in-memory fat_cache, no device I/O.
     pub fn read_fat_entry(&self, cluster: u32) -> Result<FatEntry> {
+        if cluster < FIRST_CLUSTER || cluster >= FIRST_CLUSTER + self.total_clusters {
+            return Err(FatxError::ClusterOutOfRange(
+                cluster,
+                FIRST_CLUSTER + self.total_clusters - 1,
+            ));
+        }
+
         let cache_offset = (cluster as u64 * self.fat_type.entry_size()) as usize;
+        let entry_size = self.fat_type.entry_size() as usize;
+        if cache_offset + entry_size > self.fat_cache.len() {
+            return Err(FatxError::ClusterOutOfRange(
+                cluster,
+                FIRST_CLUSTER + self.total_clusters - 1,
+            ));
+        }
 
         match self.fat_type {
             FatType::Fat16 => {
@@ -542,7 +556,13 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                     FAT16_FREE => FatEntry::Free,
                     FAT16_BAD => FatEntry::Bad,
                     v if v >= FAT16_EOC => FatEntry::EndOfChain,
-                    v => FatEntry::Next(v as u32),
+                    v => {
+                        let next = v as u32;
+                        if next < FIRST_CLUSTER || next >= FIRST_CLUSTER + self.total_clusters {
+                            return Err(FatxError::CorruptChain(cluster));
+                        }
+                        FatEntry::Next(next)
+                    }
                 })
             }
             FatType::Fat32 => {
@@ -557,7 +577,12 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                     FAT32_FREE => FatEntry::Free,
                     FAT32_BAD => FatEntry::Bad,
                     v if v >= FAT32_EOC => FatEntry::EndOfChain,
-                    v => FatEntry::Next(v),
+                    v => {
+                        if v < FIRST_CLUSTER || v >= FIRST_CLUSTER + self.total_clusters {
+                            return Err(FatxError::CorruptChain(cluster));
+                        }
+                        FatEntry::Next(v)
+                    }
                 })
             }
         }
@@ -625,11 +650,18 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
     /// the list of clusters in order.
     /// Takes `&self` — only reads from the in-memory fat_cache, no device I/O.
     pub fn read_chain(&self, start_cluster: u32) -> Result<Vec<u32>> {
+        use std::collections::HashSet;
+
         let mut chain = Vec::new();
+        let mut seen = HashSet::new();
         let mut current = start_cluster;
         let max_iters = self.total_clusters as usize + 1; // safety bound
 
         for _ in 0..max_iters {
+            if !seen.insert(current) {
+                warn!("Cluster chain cycle detected at {}", current);
+                return Err(FatxError::CorruptChain(current));
+            }
             chain.push(current);
             match self.read_fat_entry(current)? {
                 FatEntry::EndOfChain => break,
@@ -643,6 +675,11 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                     return Err(FatxError::CorruptChain(current));
                 }
             }
+        }
+
+        if chain.len() > self.total_clusters as usize {
+            warn!("Cluster chain exceeded total cluster count from {}", start_cluster);
+            return Err(FatxError::CorruptChain(current));
         }
 
         Ok(chain)
