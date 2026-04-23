@@ -888,15 +888,11 @@ fn handle_normal_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent)
                 }
             }
         }
-        KeyCode::Home => {
-            if !app.entries.is_empty() {
-                app.list_state.select(Some(0));
-            }
+        KeyCode::Home if !app.entries.is_empty() => {
+            app.list_state.select(Some(0));
         }
-        KeyCode::End => {
-            if !app.entries.is_empty() {
-                app.list_state.select(Some(app.entries.len() - 1));
-            }
+        KeyCode::End if !app.entries.is_empty() => {
+            app.list_state.select(Some(app.entries.len() - 1));
         }
         KeyCode::PageDown => {
             if let Some(sel) = app.list_state.selected() {
@@ -928,21 +924,19 @@ fn handle_normal_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent)
                 }
             }
         }
-        KeyCode::Backspace | KeyCode::Left => {
-            if app.cwd != "/" {
-                let new_cwd = if let Some(pos) = app.cwd.rfind('/') {
-                    if pos == 0 {
-                        "/".to_string()
-                    } else {
-                        app.cwd[..pos].to_string()
-                    }
-                } else {
+        KeyCode::Backspace | KeyCode::Left if app.cwd != "/" => {
+            let new_cwd = if let Some(pos) = app.cwd.rfind('/') {
+                if pos == 0 {
                     "/".to_string()
-                };
-                app.set_status("Loading...");
-                let _ = cmd_tx.send(IoCmd::ListDir { path: new_cwd });
-                app.is_busy = true;
-            }
+                } else {
+                    app.cwd[..pos].to_string()
+                }
+            } else {
+                "/".to_string()
+            };
+            app.set_status("Loading...");
+            let _ = cmd_tx.send(IoCmd::ListDir { path: new_cwd });
+            app.is_busy = true;
         }
         KeyCode::Char('d') => {
             let info = app.selected_entry().map(|e| (e.is_dir, e.name.clone()));
