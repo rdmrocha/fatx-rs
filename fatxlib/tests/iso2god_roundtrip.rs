@@ -15,6 +15,8 @@
 mod common;
 
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 
 use fatxlib::iso2god::{ConvertOptions, TrimMode, convert_iso, convert_iso_to_fatx};
@@ -22,6 +24,26 @@ use fatxlib::iso2god::{ConvertOptions, TrimMode, convert_iso, convert_iso_to_fat
 fn fixture_path() -> Option<PathBuf> {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny.xiso");
     if p.exists() { Some(p) } else { None }
+}
+
+fn padded_fixture_path() -> Option<(tempfile::TempDir, PathBuf)> {
+    let source = fixture_path()?;
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let padded = tmp.path().join("tiny-padded.xiso");
+    fs::copy(&source, &padded).expect("copy padded fixture");
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&padded)
+        .expect("open padded fixture");
+    file.write_all(&vec![0xA5; 16 * 1024 * 1024])
+        .expect("append padding");
+    Some((tmp, padded))
+}
+
+fn expected_part_len(payload_bytes: u64) -> u64 {
+    let subpart_size = fatxlib::iso2god::god::SUBPART_SIZE;
+    let subparts = payload_bytes.div_ceil(subpart_size);
+    4096 + (subparts * 4096) + payload_bytes
 }
 
 #[test]
@@ -238,5 +260,68 @@ fn streaming_dry_run_writes_nothing_to_fatx() {
     assert_eq!(
         final_free, initial_free,
         "dry-run must not allocate any clusters"
+    );
+}
+
+#[test]
+fn trim_ignores_appended_tail_padding_for_file_output() {
+    let Some((_tmp, iso)) = padded_fixture_path() else {
+        return;
+    };
+
+    let out = tempfile::TempDir::new().expect("tempdir");
+    let mut opts = ConvertOptions {
+        trim: TrimMode::FromEnd,
+        ..Default::default()
+    };
+
+    let report = convert_iso(&iso, out.path(), &mut opts).expect("convert padded iso");
+    assert_eq!(report.part_count, 1, "fixture should stay single-part");
+
+    let title_hex = format!("{:08X}", report.title_id);
+    let ctype_hex = format!("{:08X}", report.content_type as u32);
+    let media_hex = format!("{:08X}", report.media_id);
+    let data_path = out
+        .path()
+        .join(title_hex)
+        .join(ctype_hex)
+        .join(format!("{}.data/Data0000", media_hex));
+
+    let actual = fs::metadata(&data_path).expect("stat data part").len();
+    let expected = expected_part_len(report.data_size);
+    assert_eq!(
+        actual, expected,
+        "trimmed conversion should ignore appended bytes beyond the XDVDFS payload"
+    );
+}
+
+#[test]
+fn trim_ignores_appended_tail_padding_for_fatx_output() {
+    let Some((_tmp, iso)) = padded_fixture_path() else {
+        return;
+    };
+
+    let (_img_tmp, mut vol) = common::create_fatx_image(64);
+    let mut opts = ConvertOptions {
+        trim: TrimMode::FromEnd,
+        ..Default::default()
+    };
+
+    let report =
+        convert_iso_to_fatx(&iso, &mut vol, "/", &mut opts).expect("convert padded iso to fatx");
+    assert_eq!(report.part_count, 1, "fixture should stay single-part");
+
+    let data_path = format!(
+        "/{:08X}/{:08X}/{:08X}.data/Data0000",
+        report.title_id, report.content_type as u32, report.media_id
+    );
+    let actual = vol
+        .read_file_by_path(&data_path)
+        .expect("read data part")
+        .len() as u64;
+    let expected = expected_part_len(report.data_size);
+    assert_eq!(
+        actual, expected,
+        "streaming FATX conversion should ignore appended bytes beyond the XDVDFS payload"
     );
 }

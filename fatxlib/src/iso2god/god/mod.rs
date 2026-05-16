@@ -23,6 +23,7 @@ pub const SUBPART_SIZE: u64 = BLOCK_SIZE * BLOCKS_PER_SUBPART;
 pub fn write_part<R: Read + Seek, W: Write + Seek>(
     mut data_volume: R,
     part_index: u64,
+    remaining_bytes: u64,
     mut part_file: W,
 ) -> Result<()> {
     data_volume
@@ -38,14 +39,19 @@ pub fn write_part<R: Read + Seek, W: Write + Seek>(
     // grow/check ceremony and the Vec-append work that came with it. We read
     // straight into a fixed-size buffer and slice off the actual length.
     let mut subpart_buf = vec![0u8; SUBPART_SIZE as usize];
+    let mut bytes_left = remaining_bytes;
 
     for _subpart_index in 0..SUBPARTS_PER_PART {
+        if bytes_left == 0 {
+            break;
+        }
         // Fill subpart_buf one read at a time. The last subpart may be
         // short — that's fine, we slice with `got` below.
+        let want = (subpart_buf.len() as u64).min(bytes_left) as usize;
         let mut got = 0usize;
-        while got < subpart_buf.len() {
+        while got < want {
             let n = data_volume
-                .read(&mut subpart_buf[got..])
+                .read(&mut subpart_buf[got..want])
                 .map_err(FatxError::Io)?;
             if n == 0 {
                 break;
@@ -71,8 +77,9 @@ pub fn write_part<R: Read + Seek, W: Write + Seek>(
         // CoW filesystems), but APFS doesn't honor reflink on partial-
         // file writes — the re-read just doubled I/O without benefit.
         part_file.write_all(subpart).map_err(FatxError::Io)?;
+        bytes_left -= got as u64;
 
-        if got < SUBPART_SIZE as usize {
+        if got < want {
             break;
         }
     }

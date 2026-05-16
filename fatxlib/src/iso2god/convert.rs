@@ -194,8 +194,9 @@ pub fn convert_iso(
         iso_data_volume
             .seek(SeekFrom::Start(root_offset))
             .map_err(FatxError::Io)?;
+        let remaining_bytes = part_payload_bytes(data_size, part_index);
 
-        god::write_part(iso_data_volume, part_index, part_file)?;
+        god::write_part(iso_data_volume, part_index, remaining_bytes, part_file)?;
 
         if let Some(cb) = opts.progress.as_deref_mut() {
             cb("parts", part_index + 1, part_count);
@@ -307,6 +308,15 @@ fn write_part_mht(file_layout: &FileLayout, part_index: u64, mht: &HashList) -> 
 /// SUBPART_SIZE)`, which is exactly `BLOCK_SIZE * 0xa290` — the magic
 /// constant the CON header uses to describe a full part.
 const MAX_PART_BYTES: usize = 4096 + (SUBPARTS_PER_PART as usize) * (4096 + SUBPART_SIZE as usize);
+
+fn part_payload_bytes(data_size: u64, part_index: u64) -> u64 {
+    let part_start = part_index
+        .saturating_mul(BLOCKS_PER_PART)
+        .saturating_mul(BLOCK_SIZE);
+    data_size
+        .saturating_sub(part_start)
+        .min(BLOCKS_PER_PART * BLOCK_SIZE)
+}
 
 /// Convert an ISO directly into a Games-on-Demand package rooted at
 /// `dest_dir` on a FATX volume — no local staging.
@@ -437,7 +447,8 @@ where
         iso.seek(SeekFrom::Start(root_offset))
             .map_err(FatxError::Io)?;
 
-        let (len, master) = fill_part_buf(&mut iso, part_index, &mut part_buf)?;
+        let remaining_bytes = part_payload_bytes(data_size, part_index);
+        let (len, master) = fill_part_buf(&mut iso, part_index, remaining_bytes, &mut part_buf)?;
         let part_path = format!("{}/Data{:04}", data_dir, part_index);
         let reader = Cursor::new(&part_buf[..len]);
 
@@ -540,6 +551,7 @@ where
 fn fill_part_buf<R: Read + Seek>(
     data_volume: &mut R,
     part_index: u64,
+    remaining_bytes: u64,
     out: &mut [u8],
 ) -> Result<(usize, HashList)> {
     data_volume
@@ -551,12 +563,17 @@ fn fill_part_buf<R: Read + Seek>(
     // First 4 KiB reserved for the master hash list — filled in at the end.
     let mut cursor = 4096usize;
     let mut subpart_buf = vec![0u8; SUBPART_SIZE as usize];
+    let mut bytes_left = remaining_bytes;
 
     for _ in 0..SUBPARTS_PER_PART {
+        if bytes_left == 0 {
+            break;
+        }
+        let want = (subpart_buf.len() as u64).min(bytes_left) as usize;
         let mut got = 0usize;
-        while got < subpart_buf.len() {
+        while got < want {
             let n = data_volume
-                .read(&mut subpart_buf[got..])
+                .read(&mut subpart_buf[got..want])
                 .map_err(FatxError::Io)?;
             if n == 0 {
                 break;
@@ -577,10 +594,11 @@ fn fill_part_buf<R: Read + Seek>(
         cursor += 4096;
         out[cursor..cursor + got].copy_from_slice(subpart);
         cursor += got;
+        bytes_left -= got as u64;
 
         master.add_block_hash(sub_hash.bytes());
 
-        if got < SUBPART_SIZE as usize {
+        if got < want {
             break;
         }
     }
