@@ -36,6 +36,7 @@ fn converts_fixture_into_valid_god_package() {
         game_title: Some("XellLaunch2 fixture"),
         dry_run: false,
         progress: None,
+        should_abort: None,
     };
 
     let report = convert_iso(&iso, dest, &mut opts).expect("convert_iso");
@@ -115,6 +116,7 @@ fn fixture_dry_run_does_not_create_files() {
         game_title: None,
         dry_run: true,
         progress: None,
+        should_abort: None,
     };
 
     let report = convert_iso(&iso, dest, &mut opts).expect("dry-run convert");

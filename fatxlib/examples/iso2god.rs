@@ -68,6 +68,7 @@ fn main() {
         game_title: game_title.as_deref(),
         dry_run,
         progress: Some(&mut progress_cb),
+        should_abort: None,
     };
 
     match convert_iso(&source, &dest, &mut opts) {

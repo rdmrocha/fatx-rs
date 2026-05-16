@@ -57,6 +57,11 @@ pub struct ConvertOptions<'a> {
     /// Optional progress callback. Stages: "scan", "parts", "mht", "header".
     /// `current`/`total` are stage-relative.
     pub progress: Option<ProgressFn<'a>>,
+    /// Optional cancellation hook. Checked before each part write and
+    /// before each MHT-chain step; returning `true` aborts the conversion
+    /// with a clean error rather than partial silent failure. Mid-part
+    /// cancellation is not supported.
+    pub should_abort: Option<&'a dyn Fn() -> bool>,
 }
 
 /// Metadata extracted from the source ISO and the resulting layout sizing.
@@ -156,6 +161,11 @@ pub fn convert_iso(
     }
 
     for part_index in 0..part_count {
+        if let Some(abort) = opts.should_abort
+            && abort()
+        {
+            return Err(FatxError::Other("convert_iso: cancelled".to_string()));
+        }
         let part_path = file_layout.part_file_path(part_index);
         let part_file = File::options()
             .write(true)
@@ -196,6 +206,11 @@ pub fn convert_iso(
 
     let mut mht = read_part_mht(&file_layout, part_count - 1)?;
     for prev_part_index in (0..part_count - 1).rev() {
+        if let Some(abort) = opts.should_abort
+            && abort()
+        {
+            return Err(FatxError::Other("convert_iso: cancelled".to_string()));
+        }
         let mut prev_mht = read_part_mht(&file_layout, prev_part_index)?;
         prev_mht.add_hash(&mht.digest());
         write_part_mht(&file_layout, prev_part_index, &prev_mht)?;
