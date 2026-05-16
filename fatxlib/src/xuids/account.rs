@@ -73,8 +73,8 @@ fn decrypt(block: &[u8], key: &[u8]) -> Vec<u8> {
 /// encrypts and decrypts.
 fn arc4(key: &[u8], data: &mut [u8]) {
     let mut s = [0u8; 256];
-    for i in 0..256 {
-        s[i] = i as u8;
+    for (i, slot) in s.iter_mut().enumerate() {
+        *slot = i as u8;
     }
     let mut j: u8 = 0;
     for i in 0..256 {
@@ -186,8 +186,8 @@ pub(crate) mod tests {
 
     #[test]
     fn rejects_wrong_length_input() {
-        assert_eq!(extract_gamertag(&vec![0u8; 100]), None);
-        assert_eq!(extract_gamertag(&vec![0u8; ACCOUNT_BLOCK_LEN + 1]), None);
+        assert_eq!(extract_gamertag(&[0u8; 100]), None);
+        assert_eq!(extract_gamertag(&[0u8; ACCOUNT_BLOCK_LEN + 1]), None);
     }
 
     #[test]

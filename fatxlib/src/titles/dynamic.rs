@@ -164,39 +164,6 @@ pub fn scan_folder_files<T: Read + Write + Seek>(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::title_id_from_path;
-
-    #[test]
-    fn extracts_id_from_clean_path() {
-        assert_eq!(
-            title_id_from_path("/Content/0000000000000000/4D5307E6"),
-            Some(0x4D5307E6)
-        );
-    }
-
-    #[test]
-    fn extracts_id_with_trailing_slash() {
-        assert_eq!(
-            title_id_from_path("/Content/0000000000000000/4D5307E6/"),
-            Some(0x4D5307E6)
-        );
-    }
-
-    #[test]
-    fn rejects_wrong_length() {
-        // 16-hex (XUID) and short hex shouldn't match the title-ID slot.
-        assert_eq!(title_id_from_path("/Content/0000000000000000"), None);
-        assert_eq!(title_id_from_path("/Content/0000/AB"), None);
-    }
-
-    #[test]
-    fn rejects_non_hex() {
-        assert_eq!(title_id_from_path("/Content/0000000000000000/HelloAll"), None);
-    }
-}
-
 /// Resolve a title display name by reading the STFS header of the first
 /// parseable file found under `title_folder_path`.
 ///
@@ -260,4 +227,40 @@ pub fn from_folder<T: Read + Write + Seek>(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::title_id_from_path;
+
+    #[test]
+    fn extracts_id_from_clean_path() {
+        assert_eq!(
+            title_id_from_path("/Content/0000000000000000/4D5307E6"),
+            Some(0x4D5307E6)
+        );
+    }
+
+    #[test]
+    fn extracts_id_with_trailing_slash() {
+        assert_eq!(
+            title_id_from_path("/Content/0000000000000000/4D5307E6/"),
+            Some(0x4D5307E6)
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_length() {
+        // 16-hex (XUID) and short hex shouldn't match the title-ID slot.
+        assert_eq!(title_id_from_path("/Content/0000000000000000"), None);
+        assert_eq!(title_id_from_path("/Content/0000/AB"), None);
+    }
+
+    #[test]
+    fn rejects_non_hex() {
+        assert_eq!(
+            title_id_from_path("/Content/0000000000000000/HelloAll"),
+            None
+        );
+    }
 }

@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::{self, Command};
 
 use clap::{Parser, Subcommand};
-use fatxlib::partition::{detect_xbox_partitions, format_size, DetectedPartition};
+use fatxlib::partition::{DetectedPartition, detect_xbox_partitions, format_size};
 use fatxlib::types::FileAttributes;
 use fatxlib::volume::FatxVolume;
 use serde::Serialize;
@@ -23,11 +23,11 @@ use serde::Serialize;
 /// Get the size of a device, handling macOS raw block devices correctly.
 fn get_device_size(file: &mut File) -> u64 {
     // Try seek first (works for regular files / disk images)
-    if let Ok(size) = file.seek(SeekFrom::End(0)) {
-        if size > 0 {
-            let _ = file.seek(SeekFrom::Start(0));
-            return size;
-        }
+    if let Ok(size) = file.seek(SeekFrom::End(0))
+        && size > 0
+    {
+        let _ = file.seek(SeekFrom::Start(0));
+        return size;
     }
 
     // On macOS, raw devices need ioctl
@@ -349,10 +349,11 @@ fn guided_partition_selection() -> Option<SelectedPartition> {
             print!("Select partition [1-{}]: ", partitions.len());
             io::stdout().flush().unwrap();
             let input = read_line();
-            if let Ok(n) = input.parse::<usize>() {
-                if n >= 1 && n <= partitions.len() {
-                    break &partitions[n - 1];
-                }
+            if let Ok(n) = input.parse::<usize>()
+                && n >= 1
+                && n <= partitions.len()
+            {
+                break &partitions[n - 1];
             }
             println!("Invalid selection.");
         }
@@ -439,12 +440,13 @@ fn detect_macos_disks() -> Vec<String> {
             let mut disks = Vec::new();
             for line in text.lines() {
                 // Lines like "/dev/disk4 (external, physical):" indicate a disk
-                if line.starts_with("/dev/disk") && line.contains("external") {
-                    if let Some(dev) = line.split_whitespace().next() {
-                        // Remove trailing colon if present
-                        let dev = dev.trim_end_matches(':');
-                        disks.push(dev.to_string());
-                    }
+                if line.starts_with("/dev/disk")
+                    && line.contains("external")
+                    && let Some(dev) = line.split_whitespace().next()
+                {
+                    // Remove trailing colon if present
+                    let dev = dev.trim_end_matches(':');
+                    disks.push(dev.to_string());
                 }
             }
             disks
@@ -554,30 +556,30 @@ fn open_volume(
             // Try to auto-detect and list partitions
             if let Ok(mut f) = std::fs::File::open(device) {
                 let dev_size = get_device_size(&mut f);
-                if let Ok(parts) = fatxlib::partition::detect_xbox_partitions(&mut f, dev_size) {
-                    if !parts.is_empty() {
-                        eprintln!();
-                        eprintln!("Available partitions:");
-                        for p in &parts {
-                            if p.has_valid_magic {
-                                eprintln!(
-                                    "  --partition \"{}\"  ({})",
-                                    p.name,
-                                    fatxlib::partition::format_size(p.size)
-                                );
-                            }
+                if let Ok(parts) = fatxlib::partition::detect_xbox_partitions(&mut f, dev_size)
+                    && !parts.is_empty()
+                {
+                    eprintln!();
+                    eprintln!("Available partitions:");
+                    for p in &parts {
+                        if p.has_valid_magic {
+                            eprintln!(
+                                "  --partition \"{}\"  ({})",
+                                p.name,
+                                fatxlib::partition::format_size(p.size)
+                            );
                         }
-                        eprintln!();
-                        eprintln!(
-                            "Example: sudo xtafkit browse {} --partition \"{}\"",
-                            device.display(),
-                            parts
-                                .iter()
-                                .find(|p| p.has_valid_magic)
-                                .map(|p| p.name.as_str())
-                                .unwrap_or("360 Data")
-                        );
                     }
+                    eprintln!();
+                    eprintln!(
+                        "Example: sudo xtafkit browse {} --partition \"{}\"",
+                        device.display(),
+                        parts
+                            .iter()
+                            .find(|p| p.has_valid_magic)
+                            .map(|p| p.name.as_str())
+                            .unwrap_or("360 Data")
+                    );
                 }
             }
         }
@@ -905,7 +907,6 @@ fn main() {
             }
         }
 
-
         Some(Commands::Mkimage(args)) => {
             mkimage::run(args);
         }
@@ -924,7 +925,7 @@ fn main() {
             // the path itself (which describes what slot its *children* are
             // in) to identify whether the path is a title-ID folder, a
             // content-type folder holding STFS files, or something else.
-            use fatxlib::display::{folder_slot, FolderSlot};
+            use fatxlib::display::{FolderSlot, folder_slot};
             let slot_of_children = folder_slot(&path);
             let entry = match vol.resolve_path(&path) {
                 Ok(e) => e,
@@ -940,9 +941,7 @@ fn main() {
 
             // Bulk scan: path is a content-type folder of STFS files
             if entry.is_directory() && slot_of_children == FolderSlot::StfsFile {
-                match fatxlib::titles::dynamic::scan_folder_files(
-                    &mut vol, &path, !no_save,
-                ) {
+                match fatxlib::titles::dynamic::scan_folder_files(&mut vol, &path, !no_save) {
                     Ok(summary) => {
                         if json {
                             println!(
@@ -1031,9 +1030,7 @@ fn main() {
             }
 
             // Default: title-ID folder resolve (the original behavior).
-            let outcome = fatxlib::titles::dynamic::resolve_and_cache(
-                &mut vol, &path, !no_save,
-            );
+            let outcome = fatxlib::titles::dynamic::resolve_and_cache(&mut vol, &path, !no_save);
 
             match outcome {
                 Ok(fatxlib::titles::dynamic::ResolveOutcome::Resolved {
@@ -1059,9 +1056,7 @@ fn main() {
                         }
                     }
                 }
-                Ok(fatxlib::titles::dynamic::ResolveOutcome::BadTitleIdInPath {
-                    last_segment,
-                }) => {
+                Ok(fatxlib::titles::dynamic::ResolveOutcome::BadTitleIdInPath { last_segment }) => {
                     let msg = format!(
                         "path's last segment is not an 8-hex title ID: {:?}",
                         last_segment

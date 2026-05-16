@@ -16,8 +16,8 @@
 //!   * ID only in 360 → `Source::Xbox360`.
 //!   * ID only in OG  → `Source::XboxOriginal`.
 //!   * ID in both     → OG name wins (better editorial), `Source::Both`. If
-//!                      the names normalize-differ we emit a `cargo:warning`
-//!                      so genuine drift surfaces at build time.
+//!     the names normalize-differ we emit a `cargo:warning` so genuine
+//!     drift surfaces at build time.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -182,10 +182,10 @@ fn names_compatible(a: &str, b: &str) -> bool {
     let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     let short_n = normalize(short);
     for marker in [":", ";", " - ", " — "] {
-        if let Some((before, _)) = long.split_once(marker) {
-            if normalize(before) == short_n {
-                return true;
-            }
+        if let Some((before, _)) = long.split_once(marker)
+            && normalize(before) == short_n
+        {
+            return true;
         }
     }
     false

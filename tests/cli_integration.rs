@@ -65,15 +65,15 @@ fn test_version() {
 
 #[test]
 fn test_help() {
-    let output = xtafkit_bin()
-        .arg("--help")
-        .output()
-        .expect("run --help");
+    let output = xtafkit_bin().arg("--help").output().expect("run --help");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("ls"), "help should list ls command");
     assert!(stdout.contains("scan"), "help should list scan command");
-    assert!(stdout.contains("mkimage"), "help should list mkimage command");
+    assert!(
+        stdout.contains("mkimage"),
+        "help should list mkimage command"
+    );
     assert!(stdout.contains("browse"), "help should list browse command");
 }
 
@@ -156,10 +156,7 @@ fn test_ls_json() {
         "JSON output should start with a bracket; got: {}",
         &stdout[..stdout.len().min(80)]
     );
-    assert!(
-        stdout.contains("\"name\""),
-        "JSON should have a name field"
-    );
+    assert!(stdout.contains("\"name\""), "JSON should have a name field");
 }
 
 // ===========================================================================

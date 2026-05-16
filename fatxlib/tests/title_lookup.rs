@@ -4,7 +4,7 @@
 //! - Xbox 360: https://gist.github.com/AdrianCassar/c0d05a14608168259232b3ed8c77f28c
 //! - Original Xbox: https://github.com/jeltaqq/Xbox-Original-GameList
 
-use fatxlib::titles::{lookup, Source, ENTRY_COUNT};
+use fatxlib::titles::{ENTRY_COUNT, Source, lookup};
 
 #[test]
 fn resolves_360_only_title() {
@@ -38,8 +38,7 @@ fn returns_none_for_unknown_id() {
 #[test]
 fn merged_map_coverage_floor() {
     // 5133 (360) + 990 (OG) - 613 (overlap) = 5510. Floor at 5400 for slack.
-    assert!(
-        ENTRY_COUNT >= 5400,
-        "merged map looks too small: {ENTRY_COUNT}"
-    );
+    // ENTRY_COUNT is a const, so this is essentially a compile-time guard.
+    #[allow(clippy::assertions_on_constants)]
+    const _: () = assert!(ENTRY_COUNT >= 5400, "merged map looks too small");
 }

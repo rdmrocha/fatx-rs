@@ -6,7 +6,7 @@
 //!   * Unresolvable IDs render as `<raw>` unchanged.
 //!   * Slot detection follows `Content/<XUID>/<TitleID>/<ContentType>/<file>`.
 
-use fatxlib::display::{folder_slot, format_for_path, FolderSlot};
+use fatxlib::display::{FolderSlot, folder_slot, format_for_path};
 use fatxlib::{content_types, titles, xuids};
 
 #[test]
@@ -29,7 +29,10 @@ fn titles_format_preserves_lowercase_input() {
 #[test]
 fn content_types_lookup_known_ids() {
     assert_eq!(content_types::lookup(0x00001000), Some("Xbox 360 Title"));
-    assert_eq!(content_types::lookup(0x00005000), Some("Xbox Original Game"));
+    assert_eq!(
+        content_types::lookup(0x00005000),
+        Some("Xbox Original Game")
+    );
     assert_eq!(content_types::lookup(0x00080000), Some("Game Demo"));
     assert_eq!(content_types::lookup(0x000D0000), Some("Arcade Title"));
     assert_eq!(content_types::lookup(0x00010000), Some("Profile"));
@@ -58,16 +61,16 @@ fn xuids_format_shared() {
 
 #[test]
 fn xuids_format_personal_xuid_passthrough() {
-    assert_eq!(
-        xuids::format_folder("E000123456789ABC"),
-        "E000123456789ABC"
-    );
+    assert_eq!(xuids::format_folder("E000123456789ABC"), "E000123456789ABC");
 }
 
 #[test]
 fn slot_detection() {
     assert_eq!(folder_slot("/Content"), FolderSlot::Xuid);
-    assert_eq!(folder_slot("/Content/0000000000000000"), FolderSlot::TitleId);
+    assert_eq!(
+        folder_slot("/Content/0000000000000000"),
+        FolderSlot::TitleId
+    );
     assert_eq!(
         folder_slot("/Content/0000000000000000/4D5307E6"),
         FolderSlot::ContentType
@@ -107,7 +110,10 @@ fn stfs_file_slot_format_resolved_via_file_cache() {
     let path = "/Content/0000000000000000/4D5307E6/000D0000/halo_wars_pkg";
     file_cache::insert(path.to_string(), "Halo Wars".to_string());
     assert_eq!(
-        format_for_path("/Content/0000000000000000/4D5307E6/000D0000", "halo_wars_pkg"),
+        format_for_path(
+            "/Content/0000000000000000/4D5307E6/000D0000",
+            "halo_wars_pkg"
+        ),
         "Halo Wars [halo_wars_pkg]"
     );
 }
@@ -135,7 +141,10 @@ fn format_for_path_dispatches() {
         "Xbox 360 Title [00001000]"
     );
     assert_eq!(
-        format_for_path("/Content/0000000000000000/4D5307E6/00001000", "savegame.dat"),
+        format_for_path(
+            "/Content/0000000000000000/4D5307E6/00001000",
+            "savegame.dat"
+        ),
         "savegame.dat"
     );
     assert_eq!(format_for_path("/", "Photo"), "Photo");

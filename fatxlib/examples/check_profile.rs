@@ -22,8 +22,7 @@ fn main() {
     let mut found_any = false;
     let mut off = 0;
     while off + account::ACCOUNT_BLOCK_LEN <= bytes.len() {
-        if let Some(name) =
-            account::extract_gamertag(&bytes[off..off + account::ACCOUNT_BLOCK_LEN])
+        if let Some(name) = account::extract_gamertag(&bytes[off..off + account::ACCOUNT_BLOCK_LEN])
         {
             println!("  hit @ 0x{off:06X}: gamertag = {name:?}");
             found_any = true;

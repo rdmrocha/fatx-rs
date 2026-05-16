@@ -66,15 +66,17 @@ pub fn parse_header(bytes: &[u8]) -> Option<StfsHeader> {
         return None;
     }
 
-    let title_id = u32::from_be_bytes(bytes[TITLE_ID_OFFSET..TITLE_ID_OFFSET + 4].try_into().ok()?);
-
-    let display_name = decode_utf16be(
-        &bytes[DISPLAY_NAME_OFFSET..DISPLAY_NAME_OFFSET + DISPLAY_NAME_LEN],
+    let title_id = u32::from_be_bytes(
+        bytes[TITLE_ID_OFFSET..TITLE_ID_OFFSET + 4]
+            .try_into()
+            .ok()?,
     );
 
-    let title_name = decode_utf8_padded(
-        &bytes[TITLE_NAME_OFFSET..TITLE_NAME_OFFSET + TITLE_NAME_LEN],
-    );
+    let display_name =
+        decode_utf16be(&bytes[DISPLAY_NAME_OFFSET..DISPLAY_NAME_OFFSET + DISPLAY_NAME_LEN]);
+
+    let title_name =
+        decode_utf8_padded(&bytes[TITLE_NAME_OFFSET..TITLE_NAME_OFFSET + TITLE_NAME_LEN]);
 
     Some(StfsHeader {
         magic,
@@ -93,7 +95,9 @@ fn decode_utf16be(bytes: &[u8]) -> String {
         }
         chars.push(cu);
     }
-    String::from_utf16_lossy(&chars).trim_end_matches('\0').to_string()
+    String::from_utf16_lossy(&chars)
+        .trim_end_matches('\0')
+        .to_string()
 }
 
 fn decode_utf8_padded(bytes: &[u8]) -> String {

@@ -37,16 +37,16 @@
 use std::fs;
 use std::io::{self, stdout};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::{
+    ExecutableCommand,
     cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEvent},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    ExecutableCommand,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     prelude::*,
@@ -354,9 +354,7 @@ fn io_worker(
                         if fatxlib::display::folder_slot(&path)
                             == fatxlib::display::FolderSlot::Xuid
                         {
-                            let _ = fatxlib::xuids::resolve_profile_xuids(
-                                &mut vol, &entries, true,
-                            );
+                            let _ = fatxlib::xuids::resolve_profile_xuids(&mut vol, &entries, true);
                         }
                         let display: Vec<DisplayEntry> = entries
                             .iter()
@@ -698,7 +696,7 @@ fn io_worker(
             }
 
             IoCmd::ResolveTitle { path } => {
-                use fatxlib::titles::dynamic::{resolve_and_cache, ResolveOutcome};
+                use fatxlib::titles::dynamic::{ResolveOutcome, resolve_and_cache};
                 let resp = match resolve_and_cache(&mut vol, &path, true) {
                     Ok(ResolveOutcome::Resolved { name, .. }) => IoResp::Done {
                         message: format!("Resolved → {}", name),
@@ -717,9 +715,8 @@ fn io_worker(
             }
 
             IoCmd::ScanFolderFiles { path } => {
-                let resp = match fatxlib::titles::dynamic::scan_folder_files(
-                    &mut vol, &path, true,
-                ) {
+                let resp = match fatxlib::titles::dynamic::scan_folder_files(&mut vol, &path, true)
+                {
                     Ok(summary) => IoResp::Done {
                         message: format!(
                             "Scanned: {} resolved, {} skipped",
@@ -848,19 +845,19 @@ pub fn run_browser(
         }
 
         // Poll for key events (50ms timeout — ~20fps refresh)
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if app.is_busy {
-                    // Only allow Esc (cancel) while busy
-                    if key.code == KeyCode::Esc {
-                        app.cancel_flag.store(true, Ordering::Relaxed);
-                        app.set_status("Cancelling...");
-                    }
-                } else {
-                    match app.input_mode {
-                        InputMode::Normal => handle_normal_key(&mut app, &cmd_tx, key),
-                        _ => handle_input_key(&mut app, &cmd_tx, key),
-                    }
+        if event::poll(Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()?
+        {
+            if app.is_busy {
+                // Only allow Esc (cancel) while busy
+                if key.code == KeyCode::Esc {
+                    app.cancel_flag.store(true, Ordering::Relaxed);
+                    app.set_status("Cancelling...");
+                }
+            } else {
+                match app.input_mode {
+                    InputMode::Normal => handle_normal_key(&mut app, &cmd_tx, key),
+                    _ => handle_input_key(&mut app, &cmd_tx, key),
                 }
             }
         }
@@ -1005,17 +1002,17 @@ fn handle_normal_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent)
             app.set_status("Flushing...");
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if let Some(sel) = app.list_state.selected() {
-                if sel > 0 {
-                    app.list_state.select(Some(sel - 1));
-                }
+            if let Some(sel) = app.list_state.selected()
+                && sel > 0
+            {
+                app.list_state.select(Some(sel - 1));
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(sel) = app.list_state.selected() {
-                if sel + 1 < app.entries.len() {
-                    app.list_state.select(Some(sel + 1));
-                }
+            if let Some(sel) = app.list_state.selected()
+                && sel + 1 < app.entries.len()
+            {
+                app.list_state.select(Some(sel + 1));
             }
         }
         KeyCode::Home if !app.entries.is_empty() => {
@@ -1105,7 +1102,7 @@ fn handle_normal_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent)
             app.set_status(&format!("Sorted {}", mode_label));
         }
         KeyCode::Char('R') => {
-            use fatxlib::display::{folder_slot, FolderSlot};
+            use fatxlib::display::{FolderSlot, folder_slot};
             match folder_slot(&app.cwd) {
                 // Inside `/Content/<XUID>` → resolve the selected title-ID folder.
                 FolderSlot::TitleId => {
@@ -1339,10 +1336,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
             let icon = if e.is_dir { "📁" } else { "📄" };
             // Resolvable when the entry sits in a slot with an active
             // resolver and we don't yet have a display name for it.
-            let resolvable = (child_slot == fatxlib::display::FolderSlot::TitleId
-                && e.is_dir
-                || child_slot == fatxlib::display::FolderSlot::StfsFile
-                    && !e.is_dir)
+            let resolvable = (child_slot == fatxlib::display::FolderSlot::TitleId && e.is_dir
+                || child_slot == fatxlib::display::FolderSlot::StfsFile && !e.is_dir)
                 && !e.is_resolved();
             let marker = if resolvable { "?" } else { " " };
             let size_str = if e.is_dir {
@@ -1352,7 +1347,12 @@ fn ui(frame: &mut Frame, app: &mut App) {
             };
             let line = format!(
                 " {} {} {:<41} {:>10}  {}  {}",
-                icon, marker, e.label(sort_mode), size_str, e.modified, e.attributes,
+                icon,
+                marker,
+                e.label(sort_mode),
+                size_str,
+                e.modified,
+                e.attributes,
             );
             let style = if e.is_dir {
                 Style::default().fg(Color::Cyan).bold()

@@ -37,6 +37,6 @@ pub mod volume;
 pub mod xuids;
 
 pub use error::{FatxError, Result};
-pub use partition::{detect_xbox_partitions, format_size, DetectedPartition};
+pub use partition::{DetectedPartition, detect_xbox_partitions, format_size};
 pub use types::*;
 pub use volume::{FatxVolume, VolumeStats};

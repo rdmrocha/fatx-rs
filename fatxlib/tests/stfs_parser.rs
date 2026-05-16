@@ -6,7 +6,7 @@
 //!   * 0x411-0x690  Display name, 18 locales × 0x80 bytes UTF-16BE
 //!   * 0x1691-0x1710 Title name, 0x80 bytes UTF-8
 
-use fatxlib::stfs::{parse_header, StfsHeader};
+use fatxlib::stfs::{StfsHeader, parse_header};
 
 const HEADER_SIZE: usize = 0x1800;
 
@@ -22,7 +22,11 @@ fn make_header(
     buf[0x360..0x364].copy_from_slice(&title_id.to_be_bytes());
 
     // Display Name at 0x411, locale 0, UTF-16BE, up to 0x80 bytes (0x40 chars).
-    for (i, ch) in display_name_utf16be_loc0.encode_utf16().take(0x40).enumerate() {
+    for (i, ch) in display_name_utf16be_loc0
+        .encode_utf16()
+        .take(0x40)
+        .enumerate()
+    {
         let be = ch.to_be_bytes();
         buf[0x411 + i * 2] = be[0];
         buf[0x411 + i * 2 + 1] = be[1];
@@ -77,7 +81,12 @@ fn rejects_short_input() {
 
 #[test]
 fn best_name_prefers_title_name() {
-    let bytes = make_header(b"CON ", 0x4D530004, "Halo", "Halo: Combat Evolved (some package)");
+    let bytes = make_header(
+        b"CON ",
+        0x4D530004,
+        "Halo",
+        "Halo: Combat Evolved (some package)",
+    );
     let h = parse_header(&bytes).unwrap();
     assert_eq!(h.best_name(), "Halo");
 }

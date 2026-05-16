@@ -57,7 +57,9 @@ pub fn load_from(path: &Path) -> io::Result<usize> {
     }
     let text = fs::read_to_string(path)?;
     let mut loaded = 0;
-    let mut map = cache().write().map_err(|_| io::Error::other("cache lock"))?;
+    let mut map = cache()
+        .write()
+        .map_err(|_| io::Error::other("cache lock"))?;
     for line in text.lines() {
         let trimmed = line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {

@@ -165,19 +165,18 @@ pub fn resolve_profile_xuids<T: Read + Write + Seek>(
             newly_added += 1;
         }
     }
-    if persist && newly_added > 0 {
-        if let Some(p) = profile_cache::default_path() {
-            let _ = profile_cache::save_to(&p);
-        }
+    if persist
+        && newly_added > 0
+        && let Some(p) = profile_cache::default_path()
+    {
+        let _ = profile_cache::save_to(&p);
     }
     Ok(newly_added)
 }
 
 /// True for 16-hex XUIDs that aren't the all-zeros shared bucket.
 fn is_personal_xuid(s: &str) -> bool {
-    s.len() == 16
-        && s != "0000000000000000"
-        && s.chars().all(|c| c.is_ascii_hexdigit())
+    s.len() == 16 && s != "0000000000000000" && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -189,7 +188,7 @@ mod tests {
         assert!(is_personal_xuid("E00012A9B73ABE44"));
         assert!(is_personal_xuid("F000FFFFFFFFFFFF"));
         assert!(!is_personal_xuid("0000000000000000")); // shared
-        assert!(!is_personal_xuid("E00012A9B73ABE4"));  // too short
+        assert!(!is_personal_xuid("E00012A9B73ABE4")); // too short
         assert!(!is_personal_xuid("E00012A9B73ABE4XX")); // non-hex
         assert!(!is_personal_xuid(""));
         assert!(!is_personal_xuid("Content"));
@@ -259,10 +258,7 @@ mod tests {
         let block = super::account::tests::synth_block_helper("BobsTag");
         let mut buf = vec![0u8; PROFILE_SCAN_BYTES];
         buf[0x4000..0x4000 + block.len()].copy_from_slice(&block);
-        assert_eq!(
-            scan_for_account_gamertag(&buf),
-            Some("BobsTag".to_string())
-        );
+        assert_eq!(scan_for_account_gamertag(&buf), Some("BobsTag".to_string()));
     }
 
     #[test]
@@ -271,4 +267,3 @@ mod tests {
         assert_eq!(scan_for_account_gamertag(&buf), None);
     }
 }
-

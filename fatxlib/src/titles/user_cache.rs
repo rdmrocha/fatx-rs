@@ -56,7 +56,9 @@ pub fn load_from(path: &Path) -> io::Result<usize> {
     }
     let text = fs::read_to_string(path)?;
     let mut loaded = 0;
-    let mut map = cache().write().map_err(|_| io::Error::other("cache lock"))?;
+    let mut map = cache()
+        .write()
+        .map_err(|_| io::Error::other("cache lock"))?;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -86,7 +88,10 @@ pub fn save_to(path: &Path) -> io::Result<()> {
     {
         let map = cache().read().map_err(|_| io::Error::other("cache lock"))?;
         let mut file = fs::File::create(&tmp)?;
-        writeln!(file, "# xtafkit user title cache — one entry per line: <hex-id> <name>")?;
+        writeln!(
+            file,
+            "# xtafkit user title cache — one entry per line: <hex-id> <name>"
+        )?;
         let mut entries: Vec<(&u32, &String)> = map.iter().collect();
         entries.sort_by_key(|(id, _)| **id);
         for (id, name) in entries {

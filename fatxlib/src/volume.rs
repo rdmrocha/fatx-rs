@@ -230,9 +230,12 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         );
         info!(
             "Layout: partition=0x{:X}+{}, superblock=0x{:X}..0x{:X}, FAT=0x{:X}..0x{:X} (raw {}), data=0x{:X}..end",
-            partition_offset, crate::partition::format_size(partition_size),
-            partition_offset, partition_offset + SUPERBLOCK_SIZE,
-            partition_offset + fat_offset, partition_offset + fat_offset + fat_size,
+            partition_offset,
+            crate::partition::format_size(partition_size),
+            partition_offset,
+            partition_offset + SUPERBLOCK_SIZE,
+            partition_offset + fat_offset,
+            partition_offset + fat_offset + fat_size,
             crate::partition::format_size(raw_fat_size),
             partition_offset + data_offset,
         );
@@ -710,12 +713,12 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         }
 
         // Wraparound
-        if start_from > FIRST_CLUSTER {
-            if let Some(cluster) = self.bitmap_find_free(FIRST_CLUSTER, start_from) {
-                self.write_fat_entry(cluster, FatEntry::EndOfChain)?;
-                self.prev_free = cluster;
-                return Ok(cluster);
-            }
+        if start_from > FIRST_CLUSTER
+            && let Some(cluster) = self.bitmap_find_free(FIRST_CLUSTER, start_from)
+        {
+            self.write_fat_entry(cluster, FatEntry::EndOfChain)?;
+            self.prev_free = cluster;
+            return Ok(cluster);
         }
 
         Err(FatxError::DiskFull)
