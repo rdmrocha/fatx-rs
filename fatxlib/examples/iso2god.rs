@@ -2,11 +2,12 @@
 //! shape:
 //!
 //! ```text
-//! iso2god [--trim | --no-trim] [--dry-run] [--game-title TITLE] <source.iso> <dest_dir>
+//! iso2god [--trim MODE] [--dry-run] [--game-title TITLE] <source.iso> <dest_dir>
 //! ```
 //!
-//! `--trim` (from-end) is the default — almost everyone wants the trimmed
-//! output. Pass `--no-trim` to convert the full source partition.
+//! `--trim preserve-layout` is the default. Pass `--trim none` to convert
+//! the full source partition, or `--trim compact` to rebuild a dense XDVDFS
+//! image first.
 //!
 //! `-j N` isn't exposed; `convert_iso` is single-threaded.
 
@@ -19,24 +20,28 @@ use fatxlib::iso2god::{ConvertOptions, TrimMode, convert_iso};
 
 fn usage_and_exit() -> ! {
     eprintln!(
-        "usage: iso2god [--trim | --no-trim] [--dry-run] [--game-title TITLE] <source.iso> <dest_dir>"
+        "usage: iso2god [--trim preserve-layout|none|compact] [--dry-run] [--game-title TITLE] <source.iso> <dest_dir>"
     );
     process::exit(2);
 }
 
 fn main() {
     let mut args = env::args().skip(1);
-    // Default to from-end trim. Pass --no-trim to convert the full
-    // source partition.
-    let mut trim = TrimMode::FromEnd;
+    let mut trim = TrimMode::PreserveLayout;
     let mut dry_run = false;
     let mut game_title: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--trim" => trim = TrimMode::FromEnd,
-            "--no-trim" => trim = TrimMode::None,
+            "--trim" => {
+                trim = match args.next().as_deref() {
+                    Some("preserve-layout") => TrimMode::PreserveLayout,
+                    Some("none") => TrimMode::None,
+                    Some("compact") => TrimMode::Compact,
+                    _ => usage_and_exit(),
+                };
+            }
             "--dry-run" => dry_run = true,
             "--game-title" => {
                 game_title = Some(args.next().unwrap_or_else(|| usage_and_exit()));

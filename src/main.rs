@@ -174,7 +174,7 @@ enum Commands {
     },
     /// Extract every file from an Xbox / Xbox 360 XISO disc image to a
     /// local directory. Useful for inspecting an ISO's contents or for
-    /// feeding loose game files to alt dashboards (Aurora / FreeStyle / XBMC4XBOX).
+    /// feeding loose game files to alt dashboards.
     Extract {
         /// Source XISO file
         iso: PathBuf,
@@ -197,11 +197,14 @@ enum Commands {
         /// Destination directory (the title-id tree lands underneath)
         dest: PathBuf,
         /// How much of the source partition to pack:
-        ///   `from-end` (default) — walk the file tree, pack only the
-        ///   content range.
+        ///   `preserve-layout` (default) — walk the file tree, pack only
+        ///   through the highest used extent while preserving mastered
+        ///   holes inside the XDVDFS layout.
         ///   `none` — pack everything from the start of the data partition
         ///   to the end of the source file.
-        #[arg(long, value_parser = ["from-end", "none"], default_value = "from-end")]
+        ///   `compact` — rebuild a dense XDVDFS image first, then convert
+        ///   that compact image into GoD.
+        #[arg(long, value_parser = ["preserve-layout", "none", "compact"], default_value = "preserve-layout")]
         trim: String,
         /// Print the parsed metadata (TitleID, MediaID, data_size, part_count)
         /// without writing anything.
@@ -1377,8 +1380,9 @@ fn run_god(
     use std::time::Instant;
 
     let trim_mode = match trim {
-        "from-end" => fatxlib::iso2god::TrimMode::FromEnd,
+        "preserve-layout" => fatxlib::iso2god::TrimMode::PreserveLayout,
         "none" => fatxlib::iso2god::TrimMode::None,
+        "compact" => fatxlib::iso2god::TrimMode::Compact,
         other => {
             cli_error(json, &format!("invalid --trim {:?}", other));
             return;

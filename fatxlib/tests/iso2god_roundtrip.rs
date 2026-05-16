@@ -57,7 +57,7 @@ fn converts_fixture_into_valid_god_package() {
     let dest = tmp.path();
 
     let mut opts = ConvertOptions {
-        trim: TrimMode::FromEnd,
+        trim: TrimMode::PreserveLayout,
         game_title: Some("XellLaunch2 fixture"),
         dry_run: false,
         progress: None,
@@ -137,7 +137,7 @@ fn fixture_dry_run_does_not_create_files() {
     let dest = tmp.path();
 
     let mut opts = ConvertOptions {
-        trim: TrimMode::FromEnd,
+        trim: TrimMode::PreserveLayout,
         game_title: None,
         dry_run: true,
         progress: None,
@@ -188,7 +188,7 @@ fn streams_fixture_into_fatx_volume() {
     let (_tmp, mut vol) = common::create_fatx_image(8);
 
     let mut opts = ConvertOptions {
-        trim: TrimMode::FromEnd,
+        trim: TrimMode::PreserveLayout,
         game_title: Some("XellLaunch2 fixture"),
         dry_run: false,
         progress: None,
@@ -240,6 +240,63 @@ fn streams_fixture_into_fatx_volume() {
 }
 
 #[test]
+fn compact_mode_converts_fixture_into_valid_god_package() {
+    let Some(iso) = fixture_path() else {
+        return;
+    };
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let dest = tmp.path();
+
+    let mut opts = ConvertOptions {
+        trim: TrimMode::Compact,
+        game_title: Some("XellLaunch2 fixture"),
+        dry_run: false,
+        progress: None,
+        should_abort: None,
+    };
+
+    let report = convert_iso(&iso, dest, &mut opts).expect("compact convert_iso");
+    assert!(report.title_id != 0);
+    assert!(report.part_count >= 1);
+
+    let title_hex = format!("{:08X}", report.title_id);
+    let ctype_hex = format!("{:08X}", report.content_type as u32);
+    let media_hex = format!("{:08X}", report.media_id);
+    let con_header_path = dest.join(&title_hex).join(&ctype_hex).join(&media_hex);
+    assert!(con_header_path.exists(), "compact CON header missing");
+}
+
+#[test]
+fn compact_mode_streams_fixture_into_fatx_volume() {
+    let Some(iso) = fixture_path() else {
+        return;
+    };
+
+    let (_tmp, mut vol) = common::create_fatx_image(8);
+    let mut opts = ConvertOptions {
+        trim: TrimMode::Compact,
+        game_title: Some("XellLaunch2 fixture"),
+        dry_run: false,
+        progress: None,
+        should_abort: None,
+    };
+
+    let report =
+        convert_iso_to_fatx(&iso, &mut vol, "/", &mut opts).expect("compact convert_iso_to_fatx");
+    let data_path = format!(
+        "/{:08X}/{:08X}/{:08X}.data/Data0000",
+        report.title_id, report.content_type as u32, report.media_id
+    );
+    assert!(
+        !vol.read_file_by_path(&data_path)
+            .expect("read compact Data0000")
+            .is_empty(),
+        "compact Data0000 should be non-empty on FATX"
+    );
+}
+
+#[test]
 fn streaming_dry_run_writes_nothing_to_fatx() {
     let Some(iso) = fixture_path() else {
         return;
@@ -271,7 +328,7 @@ fn trim_ignores_appended_tail_padding_for_file_output() {
 
     let out = tempfile::TempDir::new().expect("tempdir");
     let mut opts = ConvertOptions {
-        trim: TrimMode::FromEnd,
+        trim: TrimMode::PreserveLayout,
         ..Default::default()
     };
 
@@ -303,7 +360,7 @@ fn trim_ignores_appended_tail_padding_for_fatx_output() {
 
     let (_img_tmp, mut vol) = common::create_fatx_image(64);
     let mut opts = ConvertOptions {
-        trim: TrimMode::FromEnd,
+        trim: TrimMode::PreserveLayout,
         ..Default::default()
     };
 

@@ -22,6 +22,9 @@ use crate::iso2god::god::{
     SUBPART_SIZE, SUBPARTS_PER_PART,
 };
 use crate::volume::FatxVolume;
+use tempfile::NamedTempFile;
+use xdvdfs::write::fs::XDVDFSFilesystem;
+use xdvdfs::write::img::{ProgressInfo, create_xdvdfs_image};
 
 /// Buffer capacity for the metadata-pass source-ISO reader. 1 MiB —
 /// large enough that the default 8 KiB capacity's syscall tax disappears
@@ -29,21 +32,25 @@ use crate::volume::FatxVolume;
 pub const SOURCE_BUFFER_SIZE: usize = 1 << 20;
 
 /// Progress callback shape: `(stage, current, total)` where `stage` is one
-/// of `"parts"`, `"mht"`, `"header"`.
+/// of `"compact"`, `"parts"`, `"mht"`, `"header"`.
 pub type ProgressFn<'a> = &'a mut dyn FnMut(&str, u64, u64);
 
 /// How to size the output GoD relative to the source ISO.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrimMode {
-    /// Walk the directory tree, find the max `(offset + size)`, and pack
-    /// only that many bytes. The default — yields the smallest output
-    /// without changing on-disk meaning.
+    /// Walk the existing directory tree, find the max `(offset + size)`,
+    /// and pack only that many bytes. Preserves any mastered holes inside
+    /// the XDVDFS layout while trimming trailing slack after the highest
+    /// file extent. This is the historical/default behavior.
     #[default]
-    FromEnd,
+    PreserveLayout,
     /// Pack every byte from the start of the data partition to the end of
     /// the source file. Larger output, but useful when the directory tree
     /// is suspect.
     None,
+    /// Rebuild the XDVDFS image densely into a temporary file, then feed
+    /// that compact image through the normal GoD pipeline.
+    Compact,
 }
 
 /// Knobs the caller can adjust per conversion.
@@ -80,6 +87,72 @@ pub struct ConvertReport {
     pub data_size: u64,
 }
 
+fn cancelled(op: &str) -> FatxError {
+    FatxError::Other(format!("{op}: cancelled"))
+}
+
+fn build_compact_xiso(
+    source_iso: &Path,
+    mut progress: Option<ProgressFn<'_>>,
+    should_abort: Option<&dyn Fn() -> bool>,
+) -> Result<NamedTempFile> {
+    if let Some(abort) = should_abort
+        && abort()
+    {
+        return Err(cancelled("compact_xiso"));
+    }
+
+    let source = File::open(source_iso).map_err(FatxError::Io)?;
+    let source = xdvdfs::blockdev::OffsetWrapper::new(source)
+        .map_err(|e| FatxError::Other(format!("xdvdfs offset detect: {e:?}")))?;
+    let mut fs = XDVDFSFilesystem::new(source)
+        .ok_or_else(|| FatxError::Other("xdvdfs compact: could not open source image".into()))?;
+
+    let temp = NamedTempFile::new().map_err(FatxError::Io)?;
+    let mut out = temp.reopen().map_err(FatxError::Io)?;
+    let mut total_files = 0u64;
+    let mut written_files = 0u64;
+
+    create_xdvdfs_image(&mut fs, &mut out, |info| {
+        if let Some(abort) = should_abort
+            && abort()
+        {
+            return;
+        }
+        if let Some(cb) = progress.as_deref_mut() {
+            match info {
+                ProgressInfo::FileCount(count) => {
+                    total_files = count as u64;
+                    cb("compact", 0, total_files.max(1));
+                }
+                ProgressInfo::FileAdded(_, _) => {
+                    written_files += 1;
+                    cb(
+                        "compact",
+                        written_files,
+                        total_files.max(written_files).max(1),
+                    );
+                }
+                ProgressInfo::FinishedPacking => {
+                    let total = total_files.max(written_files).max(1);
+                    cb("compact", total, total);
+                }
+                _ => {}
+            }
+        }
+    })
+    .map_err(|e| FatxError::Other(format!("xdvdfs compact: {e}")))?;
+
+    if let Some(abort) = should_abort
+        && abort()
+    {
+        return Err(cancelled("compact_xiso"));
+    }
+
+    out.sync_all().map_err(FatxError::Io)?;
+    Ok(temp)
+}
+
 /// Convert an Xbox 360 / original-Xbox ISO into a Games-on-Demand package.
 ///
 /// Writes:
@@ -88,11 +161,24 @@ pub struct ConvertReport {
 ///
 /// Returns a [`ConvertReport`] describing what was produced (or what *would*
 /// have been, when `opts.dry_run` is set).
-pub fn convert_iso(
+pub fn convert_iso<'a>(
     source_iso: &Path,
     dest_dir: &Path,
-    opts: &mut ConvertOptions<'_>,
+    opts: &'a mut ConvertOptions<'a>,
 ) -> Result<ConvertReport> {
+    if matches!(opts.trim, TrimMode::Compact) {
+        let compact =
+            build_compact_xiso(source_iso, opts.progress.as_deref_mut(), opts.should_abort)?;
+        let mut forwarded_opts = ConvertOptions {
+            trim: TrimMode::PreserveLayout,
+            game_title: opts.game_title,
+            dry_run: opts.dry_run,
+            progress: None,
+            should_abort: opts.should_abort,
+        };
+        return convert_iso(compact.path(), dest_dir, &mut forwarded_opts);
+    }
+
     let source_iso_file_meta = fs::metadata(source_iso).map_err(FatxError::Io)?;
 
     let img = File::open(source_iso).map_err(FatxError::Io)?;
@@ -115,7 +201,7 @@ pub fn convert_iso(
     };
 
     let data_size = match opts.trim {
-        TrimMode::FromEnd => volume
+        TrimMode::PreserveLayout => volume
             .root_table
             .file_tree(&mut xiso)
             .map_err(|e| FatxError::Other(format!("xdvdfs file_tree: {e:?}")))?
@@ -136,6 +222,7 @@ pub fn convert_iso(
             .max()
             .unwrap_or(0),
         TrimMode::None => source_iso_file_meta.len() - root_offset,
+        TrimMode::Compact => unreachable!("compact handled before metadata pass"),
     };
 
     let block_count = data_size.div_ceil(god::BLOCK_SIZE);
@@ -331,15 +418,28 @@ fn part_payload_bytes(data_size: u64, part_index: u64) -> u64 {
 ///
 /// Peak RAM: one part buffer (~163 MiB) plus the per-part master hash
 /// list vector (~108 KiB total for a 27-part game).
-pub fn convert_iso_to_fatx<T>(
+pub fn convert_iso_to_fatx<'a, T>(
     source_iso: &Path,
     vol: &mut FatxVolume<T>,
     dest_dir: &str,
-    opts: &mut ConvertOptions<'_>,
+    opts: &'a mut ConvertOptions<'a>,
 ) -> Result<ConvertReport>
 where
     T: Read + Seek + Write,
 {
+    if matches!(opts.trim, TrimMode::Compact) {
+        let compact =
+            build_compact_xiso(source_iso, opts.progress.as_deref_mut(), opts.should_abort)?;
+        let mut forwarded_opts = ConvertOptions {
+            trim: TrimMode::PreserveLayout,
+            game_title: opts.game_title,
+            dry_run: opts.dry_run,
+            progress: None,
+            should_abort: opts.should_abort,
+        };
+        return convert_iso_to_fatx(compact.path(), vol, dest_dir, &mut forwarded_opts);
+    }
+
     // --- Metadata pass (mirrors convert_iso) --------------------------------
     let source_iso_file_meta = fs::metadata(source_iso).map_err(FatxError::Io)?;
 
@@ -361,7 +461,7 @@ where
     };
 
     let data_size = match opts.trim {
-        TrimMode::FromEnd => volume
+        TrimMode::PreserveLayout => volume
             .root_table
             .file_tree(&mut xiso)
             .map_err(|e| FatxError::Other(format!("xdvdfs file_tree: {e:?}")))?
@@ -382,6 +482,7 @@ where
             .max()
             .unwrap_or(0),
         TrimMode::None => source_iso_file_meta.len() - root_offset,
+        TrimMode::Compact => unreachable!("compact handled before metadata pass"),
     };
 
     let block_count = data_size.div_ceil(BLOCK_SIZE);

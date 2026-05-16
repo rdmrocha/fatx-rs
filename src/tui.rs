@@ -899,6 +899,7 @@ fn io_worker(
                 // Dry-run first so we can resolve the human-readable title
                 // and announce the destination before the streaming pass.
                 let mut dry_opts = fatxlib::iso2god::ConvertOptions {
+                    trim: fatxlib::iso2god::TrimMode::Compact,
                     dry_run: true,
                     ..Default::default()
                 };
@@ -995,7 +996,7 @@ fn io_worker(
                 };
 
                 let mut opts = fatxlib::iso2god::ConvertOptions {
-                    trim: fatxlib::iso2god::TrimMode::FromEnd,
+                    trim: fatxlib::iso2god::TrimMode::Compact,
                     game_title: resolved_name,
                     dry_run: false,
                     progress: Some(&mut progress_cb),
