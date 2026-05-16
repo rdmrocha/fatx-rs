@@ -2,7 +2,7 @@
 
 All notable changes to `xtafkit` will be documented in this file.
 
-## [1.0.0] - 2026-05-16
+## [1.1.0] - 2026-05-16
 
 First release under the `xtafkit` name. Forked from
 [joshuareisbord/fatx-rs](https://github.com/joshuareisbord/fatx-rs); the
