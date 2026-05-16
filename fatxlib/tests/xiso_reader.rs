@@ -61,8 +61,8 @@ fn walks_fixture_image() {
     );
     let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
     assert!(
-        names.iter().any(|n| n.ends_with("default.xbe")),
-        "expected default.xbe in fixture; got {:?}",
+        names.iter().any(|n| n.ends_with("default.xex")),
+        "expected default.xex (XellLaunch2_retail) in fixture; got {:?}",
         names
     );
 }
