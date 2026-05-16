@@ -6,10 +6,10 @@
 //! project). The XEX has valid `XEX2` magic + execution-info fields, so
 //! `TitleInfo::from_image` parses it cleanly and the full pipeline runs.
 //!
-//! Plan C already proved byte-identical output across iliazeus, QAston,
-//! and the Python port on a real game ISO, so this test focuses on
-//! "the pipeline runs to completion and the output is shaped correctly",
-//! not byte-equality.
+//! Focuses on "the pipeline runs to completion and the output is shaped
+//! correctly", not byte-equality — the GoD format is deterministic, and
+//! byte-equality is best validated against an external reference
+//! conversion when one is available.
 
 use std::fs;
 use std::path::PathBuf;

@@ -1,16 +1,14 @@
-//! Minimal CLI wrapper around [`fatxlib::iso2god::convert_iso`].
-//!
-//! Mirrors the surface of upstream's `iso2god` binary so the Plan C bench
-//! harness can run our build in apples-to-apples fashion. Argument shape:
+//! Minimal CLI wrapper around [`fatxlib::iso2god::convert_iso`]. Argument
+//! shape:
 //!
 //! ```text
-//! iso2god [--trim] [--dry-run] [--game-title TITLE] <source.iso> <dest_dir>
+//! iso2god [--trim | --no-trim] [--dry-run] [--game-title TITLE] <source.iso> <dest_dir>
 //! ```
 //!
-//! Differences vs upstream:
-//! - `--trim` is a flag without an argument (matches upstream `--trim`,
-//!   defaults to no trim if absent; pass to enable from-end trim).
-//! - We don't expose `-j N` because `convert_iso` is single-threaded for now.
+//! `--trim` (from-end) is the default — almost everyone wants the trimmed
+//! output. Pass `--no-trim` to convert the full source partition.
+//!
+//! `-j N` isn't exposed; `convert_iso` is single-threaded.
 
 use std::env;
 use std::path::PathBuf;
@@ -20,13 +18,17 @@ use std::time::Instant;
 use fatxlib::iso2god::{ConvertOptions, TrimMode, convert_iso};
 
 fn usage_and_exit() -> ! {
-    eprintln!("usage: iso2god [--trim] [--dry-run] [--game-title TITLE] <source.iso> <dest_dir>");
+    eprintln!(
+        "usage: iso2god [--trim | --no-trim] [--dry-run] [--game-title TITLE] <source.iso> <dest_dir>"
+    );
     process::exit(2);
 }
 
 fn main() {
     let mut args = env::args().skip(1);
-    let mut trim = TrimMode::None;
+    // Default to from-end trim. Pass --no-trim to convert the full
+    // source partition.
+    let mut trim = TrimMode::FromEnd;
     let mut dry_run = false;
     let mut game_title: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
@@ -34,6 +36,7 @@ fn main() {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--trim" => trim = TrimMode::FromEnd,
+            "--no-trim" => trim = TrimMode::None,
             "--dry-run" => dry_run = true,
             "--game-title" => {
                 game_title = Some(args.next().unwrap_or_else(|| usage_and_exit()));

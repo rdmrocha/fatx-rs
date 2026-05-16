@@ -1,26 +1,27 @@
 //! Public entry point for ISO → Games-on-Demand conversion.
 //!
-//! Mirrors the flow of QAston/iso2god-rs `xdvdfx`'s `src/bin/iso2god.rs::main`,
-//! translated onto fatxlib's error type and with a 1 MiB BufReader wrapping
-//! the source (Plan C finding: upstream's default 8 KiB buffer leaves ~5 s of
-//! avoidable I/O wait per 8.7 GiB ISO).
+//! Walks the source ISO via xdvdfs, computes the GoD file layout, writes
+//! each Data part with its embedded hash tree, and finalizes the CON
+//! header. See `NOTICE` and the [`crate::iso2god`] module doc for the
+//! upstream sources this code descends from.
 //!
-//! Single-threaded for now — upstream uses rayon for parallelism, but the
-//! Plan C bench ran `-j 1` and `convert_iso` matches that for apples-to-apples
-//! re-measurement. Parallel mode can land later as an opt-in flag.
+//! Single-threaded. The metadata pre-pass uses a 1 MiB `BufReader` to cut
+//! syscall tax on the file-tree walk; per-part data reads go straight
+//! against the file (a fixed-size subpart read into a pre-allocated
+//! buffer makes an interposing reader pure overhead). A multi-threaded
+//! mode could land later as an opt-in flag.
 
 use std::fs::{self, File};
-use std::io::{BufReader, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::error::{FatxError, Result};
 use crate::iso2god::executable::TitleInfo;
 use crate::iso2god::god::{self, ConHeaderBuilder, ContentType, FileLayout, HashList};
 
-/// Buffer capacity for the source-ISO reader. 1 MiB — Plan C measured that
-/// upstream's default-cap (8 KiB) `BufReader` leaves ~5 s of avoidable I/O
-/// wait per 8.7 GiB ISO; pushing the buffer up to a megabyte reclaims most
-/// of it without OS-level read-ahead tuning.
+/// Buffer capacity for the metadata-pass source-ISO reader. 1 MiB —
+/// large enough that the default 8 KiB capacity's syscall tax disappears
+/// on multi-GiB ISOs, without requiring OS-level read-ahead tuning.
 pub const SOURCE_BUFFER_SIZE: usize = 1 << 20;
 
 /// Progress callback shape: `(stage, current, total)` where `stage` is one
@@ -31,8 +32,8 @@ pub type ProgressFn<'a> = &'a mut dyn FnMut(&str, u64, u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrimMode {
     /// Walk the directory tree, find the max `(offset + size)`, and pack
-    /// only that many bytes. This is upstream's default and matches the
-    /// Python port.
+    /// only that many bytes. The default — yields the smallest output
+    /// without changing on-disk meaning.
     #[default]
     FromEnd,
     /// Pack every byte from the start of the data partition to the end of
@@ -97,8 +98,8 @@ pub fn convert_iso(
     let exe_info = title_info.execution_info;
     let content_type = title_info.content_type;
 
-    // Pull the partition offset out from the wrapper — upstream calls this
-    // "root_offset" and uses it as the per-part `seek` target.
+    // Pull the partition offset out from the wrapper; the per-part
+    // readers use it as their `seek` target.
     let root_offset = {
         xiso.seek(SeekFrom::Start(0)).map_err(FatxError::Io)?;
         xiso.get_mut().stream_position().map_err(FatxError::Io)?
@@ -148,7 +149,7 @@ pub fn convert_iso(
 
     ensure_empty_dir(&file_layout.data_dir_path())?;
 
-    // ---- Write the Data parts (sequential, matches `-j 1` upstream) -----
+    // ---- Write the Data parts (sequential) ------------------------------
 
     if let Some(cb) = opts.progress.as_deref_mut() {
         cb("parts", 0, part_count);
@@ -162,14 +163,20 @@ pub fn convert_iso(
             .truncate(true)
             .open(&part_path)
             .map_err(FatxError::Io)?;
+        // Wrap the part output in a 1 MiB BufWriter so the interleaved
+        // 4 KiB hash-list writes and the larger subpart writes don't
+        // each turn into separate syscalls. The subpart writes themselves
+        // bypass the buffer (they're larger than the free space), but
+        // the hash writes ride on top of them for free.
+        let part_file = BufWriter::with_capacity(SOURCE_BUFFER_SIZE, part_file);
 
-        // Fresh source reader per part so we can `seek_relative` from a known
-        // starting point (root_offset). Buffered for the same I/O reasons as
-        // the metadata read above.
-        let mut iso_data_volume = BufReader::with_capacity(
-            SOURCE_BUFFER_SIZE,
-            File::open(source_iso).map_err(FatxError::Io)?,
-        );
+        // Fresh source reader per part so we can `seek` from a known
+        // starting point (root_offset). Deliberately UNbuffered — the
+        // inner hot loop in `god::write_part` reads exactly SUBPART_SIZE
+        // (~832 KiB) per pass into a pre-allocated buffer; an interposing
+        // BufReader at that read size just adds an extra memcpy through
+        // its internal buffer with no syscall-batching benefit.
+        let mut iso_data_volume = File::open(source_iso).map_err(FatxError::Io)?;
         iso_data_volume
             .seek(SeekFrom::Start(root_offset))
             .map_err(FatxError::Io)?;

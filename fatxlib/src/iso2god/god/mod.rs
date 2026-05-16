@@ -34,40 +34,47 @@ pub fn write_part<R: Read + Seek, W: Write + Seek>(
     let master_hash_list_position = part_file.stream_position().map_err(FatxError::Io)?;
     master_hash_list.write(&mut part_file)?;
 
-    let mut subpart_buf = Vec::with_capacity(SUBPART_SIZE as usize);
+    // Pre-allocated subpart buffer — avoids `take + read_to_end`'s repeated
+    // grow/check ceremony and the Vec-append work that came with it. We read
+    // straight into a fixed-size buffer and slice off the actual length.
+    let mut subpart_buf = vec![0u8; SUBPART_SIZE as usize];
 
     for _subpart_index in 0..SUBPARTS_PER_PART {
-        data_volume
-            .by_ref()
-            .take(SUBPART_SIZE)
-            .read_to_end(&mut subpart_buf)
-            .map_err(FatxError::Io)?;
-
-        if subpart_buf.is_empty() {
+        // Fill subpart_buf one read at a time. The last subpart may be
+        // short — that's fine, we slice with `got` below.
+        let mut got = 0usize;
+        while got < subpart_buf.len() {
+            let n = data_volume
+                .read(&mut subpart_buf[got..])
+                .map_err(FatxError::Io)?;
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        if got == 0 {
             break;
         }
+        let subpart = &subpart_buf[..got];
 
         let mut sub_hash_list = HashList::new();
 
-        for block in subpart_buf.chunks(BLOCK_SIZE as usize) {
+        for block in subpart.chunks(BLOCK_SIZE as usize) {
             sub_hash_list.add_block_hash(block);
         }
 
         sub_hash_list.write(&mut part_file)?;
         master_hash_list.add_block_hash(sub_hash_list.bytes());
 
-        // using io::copy here to benefit from potential reflink optimizations
-        // https://doc.rust-lang.org/std/io/fn.copy.html#platform-specific-behavior
-        data_volume
-            .seek_relative(0 - subpart_buf.len() as i64)
-            .map_err(FatxError::Io)?;
-        std::io::copy(&mut data_volume.by_ref().take(SUBPART_SIZE), &mut part_file)
-            .map_err(FatxError::Io)?;
+        // Write the subpart we already buffered. An earlier shape
+        // seeked back and re-read via `io::copy` (a `reflink` hint for
+        // CoW filesystems), but APFS doesn't honor reflink on partial-
+        // file writes — the re-read just doubled I/O without benefit.
+        part_file.write_all(subpart).map_err(FatxError::Io)?;
 
-        if subpart_buf.len() < SUBPART_SIZE as usize {
+        if got < SUBPART_SIZE as usize {
             break;
         }
-        subpart_buf.clear();
     }
 
     part_file

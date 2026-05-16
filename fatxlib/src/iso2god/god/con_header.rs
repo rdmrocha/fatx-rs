@@ -1,8 +1,7 @@
 use byteorder::{BE, ByteOrder, LE};
 
-use sha1::{Digest, Sha1};
-
 use crate::iso2god::executable::TitleExecutionInfo;
+use crate::iso2god::sha1_digest;
 
 const EMPTY_LIVE: &[u8] = include_bytes!("empty_live.bin");
 
@@ -114,7 +113,7 @@ impl ConHeaderBuilder {
         self.buffer[0x035f] = 0;
         self.buffer[0x0391] = 0;
 
-        let digest: [u8; 20] = Sha1::digest(&self.buffer[0x0344..(0x0344 + 0xacbc)]).into();
+        let digest = sha1_digest(&self.buffer[0x0344..(0x0344 + 0xacbc)]);
         self.write_bytes(0x032c, &digest);
 
         self.buffer

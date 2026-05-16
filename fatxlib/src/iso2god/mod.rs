@@ -22,3 +22,25 @@ pub mod god;
 
 mod convert;
 pub use convert::{ConvertOptions, ConvertReport, SOURCE_BUFFER_SIZE, TrimMode, convert_iso};
+
+/// Single hot-path SHA-1 entry point used by [`god::HashList`] and
+/// [`god::ConHeaderBuilder`]. With the `openssl-hash` feature (default on)
+/// this routes to `openssl::sha::sha1`, which uses ARMv8 SHA on Apple
+/// Silicon and SHA-NI on x86. Without the feature it falls back to the
+/// portable-Rust `sha1` crate.
+///
+/// On hardware that exposes accelerated SHA-1, the OpenSSL path can be
+/// measurably faster for large workloads. Disable the feature to drop
+/// the dependency if the build environment can't reach a system OpenSSL.
+#[inline]
+pub(crate) fn sha1_digest(data: &[u8]) -> [u8; 20] {
+    #[cfg(feature = "openssl-hash")]
+    {
+        openssl::sha::sha1(data)
+    }
+    #[cfg(not(feature = "openssl-hash"))]
+    {
+        use sha1::{Digest, Sha1};
+        Sha1::digest(data).into()
+    }
+}

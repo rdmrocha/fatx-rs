@@ -1,8 +1,7 @@
 use std::io::{Read, Write};
 
-use sha1::{Digest, Sha1};
-
 use crate::error::{FatxError, Result};
+use crate::iso2god::sha1_digest;
 
 pub struct HashList {
     buffer: [u8; 4096],
@@ -46,11 +45,11 @@ impl HashList {
     }
 
     pub fn add_block_hash(&mut self, block: &[u8]) {
-        self.add_hash(&Sha1::digest(block).into())
+        self.add_hash(&sha1_digest(block))
     }
 
     pub fn digest(&self) -> [u8; 20] {
-        Sha1::digest(self.buffer).into()
+        sha1_digest(&self.buffer)
     }
 
     pub fn write<W: Write>(&self, mut writer: W) -> Result<()> {
