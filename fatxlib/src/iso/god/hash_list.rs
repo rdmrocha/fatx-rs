@@ -1,7 +1,8 @@
 use std::io::{Read, Write};
 
 use crate::error::{FatxError, Result};
-use crate::iso2god::sha1_digest;
+
+use super::sha1_digest;
 
 pub struct HashList {
     buffer: [u8; 4096],

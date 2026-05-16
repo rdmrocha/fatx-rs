@@ -1,7 +1,8 @@
 use byteorder::{BE, ByteOrder, LE};
 
 use crate::executable::TitleExecutionInfo;
-use crate::iso2god::sha1_digest;
+
+use super::sha1_digest;
 
 const EMPTY_LIVE: &[u8] = include_bytes!("empty_live.bin");
 

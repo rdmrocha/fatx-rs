@@ -1,6 +1,28 @@
+//! ISO → Games-on-Demand conversion pipeline.
+//!
+//! Vendored from [QAston/iso2god-rs `xdvdfx` branch](https://github.com/QAston/iso2god-rs/tree/xdvdfx)
+//! (parent: [iliazeus/iso2god-rs](https://github.com/iliazeus/iso2god-rs);
+//! both MIT-licensed). Local deviations from upstream:
+//!
+//! - `anyhow::Error` → [`crate::error::FatxError`] so errors flow through
+//!   the same channel as the rest of fatxlib.
+//! - Upstream's `src/executable/` lives at [`crate::executable`] now and is
+//!   shared with the XDVDFS image reader.
+//! - The original `src/game_list/` (4.9 KLOC of compiled-in title catalog) is
+//!   dropped; fatxlib already has a richer catalog via [`crate::titles`].
+//! - The upstream binary (`src/bin/iso2god.rs`) lives elsewhere — fatxlib only
+//!   provides the library surface; the CLI/TUI wraps it in `xtafkit`.
+//!
+//! See `NOTICE` at the repo root for the full attribution.
+
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::error::{FatxError, Result};
+
+mod convert;
+pub use convert::{
+    ConvertOptions, ConvertReport, SOURCE_BUFFER_SIZE, TrimMode, convert_iso, convert_iso_to_fatx,
+};
 
 mod con_header;
 pub use con_header::*;
@@ -13,6 +35,24 @@ pub use gdf_sector::*;
 
 mod hash_list;
 pub use hash_list::*;
+
+/// Single hot-path SHA-1 entry point used by [`HashList`] and
+/// [`ConHeaderBuilder`]. With the `openssl-hash` feature (default on)
+/// this routes to `openssl::sha::sha1`, which uses ARMv8 SHA on Apple
+/// Silicon and SHA-NI on x86. Without the feature it falls back to the
+/// portable-Rust `sha1` crate.
+#[inline]
+pub(crate) fn sha1_digest(data: &[u8]) -> [u8; 20] {
+    #[cfg(feature = "openssl-hash")]
+    {
+        openssl::sha::sha1(data)
+    }
+    #[cfg(not(feature = "openssl-hash"))]
+    {
+        use sha1::{Digest, Sha1};
+        Sha1::digest(data).into()
+    }
+}
 
 pub const BLOCKS_PER_PART: u64 = 0xa1c4;
 pub const BLOCKS_PER_SUBPART: u64 = 0xcc;

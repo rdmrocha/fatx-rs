@@ -61,10 +61,10 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 
+use fatxlib::iso::image::XisoImage;
 use fatxlib::partition::format_size;
 use fatxlib::types::FileAttributes;
 use fatxlib::volume::FatxVolume;
-use fatxlib::xiso::XisoImage;
 
 // ===========================================================================
 // Display types
@@ -364,20 +364,6 @@ fn sanitize_fatx_filename(raw: &str) -> String {
             .trim_end_matches(['.', ' ', '-'])
             .to_string()
     }
-}
-
-/// Image-relative paths we always strip when extracting an XISO. Currently
-/// just `$SystemUpdate/*` — dashboard update payload that alt dashboards
-/// never launch and that wastes tens to hundreds of MiB on the destination
-/// drive. `image_path` is expected to use forward slashes; the match is
-/// case-insensitive against the first segment.
-fn is_xiso_junk(image_path: &str) -> bool {
-    let first = image_path
-        .trim_start_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or("");
-    first.eq_ignore_ascii_case("$SystemUpdate")
 }
 
 fn dirs_or_home() -> PathBuf {
@@ -735,8 +721,8 @@ fn io_worker(
                         continue;
                     }
                 };
-                let entries = match img.walk_files() {
-                    Ok(v) => v,
+                let plan = match fatxlib::iso::extract::plan_extract(&mut img, false) {
+                    Ok(plan) => plan,
                     Err(e) => {
                         let _ = resp_tx.send(IoResp::Error {
                             message: format!("Walk {}: {}", source.display(), e),
@@ -753,21 +739,10 @@ fn io_worker(
                     continue;
                 }
 
-                // Xbox 360 disc images carry a `$SystemUpdate` folder with
-                // the dashboard update payload. Alt dashboards never run it,
-                // and copying it just wastes hundreds of MiB of FATX space —
-                // so partition them out before counting totals so the per-file
-                // progress denominator reflects what we'll actually write.
-                let (kept, skipped): (
-                    Vec<&fatxlib::xiso::XisoFile>,
-                    Vec<&fatxlib::xiso::XisoFile>,
-                ) = entries
-                    .iter()
-                    .partition(|e| !is_xiso_junk(&e.path.replace('\\', "/")));
-                let total_files = kept.len();
-                let total_bytes: u64 = kept.iter().map(|f| f.size).sum();
-                let skipped_files = skipped.len();
-                let skipped_bytes: u64 = skipped.iter().map(|f| f.size).sum();
+                let total_files = plan.kept_files();
+                let total_bytes = plan.kept_bytes;
+                let skipped_files = plan.skipped_files();
+                let skipped_bytes = plan.skipped_bytes;
 
                 let mut files_done = 0usize;
                 let mut bytes_done: u64 = 0;
@@ -776,7 +751,7 @@ fn io_worker(
                 let mut cancelled = false;
                 let mut failed = false;
 
-                for entry in &kept {
+                for entry in &plan.kept {
                     if cancel_flag.load(Ordering::Relaxed) {
                         cancelled = true;
                         break;
@@ -898,12 +873,12 @@ fn io_worker(
 
                 // Dry-run first so we can resolve the human-readable title
                 // and announce the destination before the streaming pass.
-                let mut dry_opts = fatxlib::iso2god::ConvertOptions {
-                    trim: fatxlib::iso2god::TrimMode::Compact,
+                let mut dry_opts = fatxlib::iso::god::ConvertOptions {
+                    trim: fatxlib::iso::god::TrimMode::Compact,
                     dry_run: true,
                     ..Default::default()
                 };
-                let report = match fatxlib::iso2god::convert_iso_to_fatx(
+                let report = match fatxlib::iso::god::convert_iso_to_fatx(
                     &source,
                     &mut vol,
                     &dest_dir,
@@ -995,16 +970,17 @@ fn io_worker(
                     last_emit_bytes = current;
                 };
 
-                let mut opts = fatxlib::iso2god::ConvertOptions {
-                    trim: fatxlib::iso2god::TrimMode::Compact,
+                let mut opts = fatxlib::iso::god::ConvertOptions {
+                    trim: fatxlib::iso::god::TrimMode::Compact,
                     game_title: resolved_name,
                     dry_run: false,
                     progress: Some(&mut progress_cb),
                     should_abort: Some(&abort_fn),
                 };
 
-                match fatxlib::iso2god::convert_iso_to_fatx(&source, &mut vol, &dest_dir, &mut opts)
-                {
+                match fatxlib::iso::god::convert_iso_to_fatx(
+                    &source, &mut vol, &dest_dir, &mut opts,
+                ) {
                     Ok(r) => {
                         let _ = vol.flush();
                         // Rough total: per-part overhead (4 KiB master +
@@ -2068,15 +2044,23 @@ mod tests {
 
     #[test]
     fn test_is_xiso_junk_systemupdate() {
-        assert!(is_xiso_junk("$SystemUpdate"));
-        assert!(is_xiso_junk("$SystemUpdate/su20076000_00000000"));
-        assert!(is_xiso_junk("/$SystemUpdate/anything"));
+        assert!(fatxlib::iso::policy::is_systemupdate_path("$SystemUpdate"));
+        assert!(fatxlib::iso::policy::is_systemupdate_path(
+            "$SystemUpdate/su20076000_00000000"
+        ));
+        assert!(fatxlib::iso::policy::is_systemupdate_path(
+            "/$SystemUpdate/anything"
+        ));
     }
 
     #[test]
     fn test_is_xiso_junk_case_insensitive() {
-        assert!(is_xiso_junk("$SYSTEMUPDATE/foo"));
-        assert!(is_xiso_junk("$systemupdate/foo"));
+        assert!(fatxlib::iso::policy::is_systemupdate_path(
+            "$SYSTEMUPDATE/foo"
+        ));
+        assert!(fatxlib::iso::policy::is_systemupdate_path(
+            "$systemupdate/foo"
+        ));
     }
 
     #[test]
@@ -2160,8 +2144,12 @@ mod tests {
 
     #[test]
     fn test_is_xiso_junk_does_not_match_substring() {
-        assert!(!is_xiso_junk("default.xbe"));
-        assert!(!is_xiso_junk("Media/$SystemUpdate")); // not the first segment
-        assert!(!is_xiso_junk("MyGame$SystemUpdate/foo"));
+        assert!(!fatxlib::iso::policy::is_systemupdate_path("default.xbe"));
+        assert!(!fatxlib::iso::policy::is_systemupdate_path(
+            "Media/$SystemUpdate"
+        )); // not the first segment
+        assert!(!fatxlib::iso::policy::is_systemupdate_path(
+            "MyGame$SystemUpdate/foo"
+        ));
     }
 }

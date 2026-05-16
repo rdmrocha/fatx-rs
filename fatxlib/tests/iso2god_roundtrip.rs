@@ -1,5 +1,5 @@
-//! Integration smoke test for [`fatxlib::iso2god::convert_iso`] and
-//! [`fatxlib::iso2god::convert_iso_to_fatx`].
+//! Integration smoke test for [`fatxlib::iso::god::convert_iso`] and
+//! [`fatxlib::iso::god::convert_iso_to_fatx`].
 //!
 //! Runs end-to-end against the bundled `tiny.xiso` fixture — a synthetic
 //! XISO packed via `xdvdfs pack` that contains a real `default.xex`
@@ -19,7 +19,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
-use fatxlib::iso2god::{ConvertOptions, TrimMode, convert_iso, convert_iso_to_fatx};
+use fatxlib::iso::god::{ConvertOptions, TrimMode, convert_iso, convert_iso_to_fatx};
 
 fn fixture_path() -> Option<PathBuf> {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny.xiso");
@@ -41,7 +41,7 @@ fn padded_fixture_path() -> Option<(tempfile::TempDir, PathBuf)> {
 }
 
 fn expected_part_len(payload_bytes: u64) -> u64 {
-    let subpart_size = fatxlib::iso2god::god::SUBPART_SIZE;
+    let subpart_size = fatxlib::iso::god::SUBPART_SIZE;
     let subparts = payload_bytes.div_ceil(subpart_size);
     4096 + (subparts * 4096) + payload_bytes
 }
@@ -79,7 +79,7 @@ fn converts_fixture_into_valid_god_package() {
     let ctype_hex = format!("{:08X}", report.content_type as u32);
     let media_hex = if matches!(
         report.content_type,
-        fatxlib::iso2god::god::ContentType::XboxOriginal
+        fatxlib::iso::god::ContentType::XboxOriginal
     ) {
         title_hex.clone()
     } else {
@@ -205,7 +205,7 @@ fn streams_fixture_into_fatx_volume() {
     let content_dir = format!("{}/{:08X}", title_dir, report.content_type as u32);
     let media_id_hex = if matches!(
         report.content_type,
-        fatxlib::iso2god::god::ContentType::XboxOriginal
+        fatxlib::iso::god::ContentType::XboxOriginal
     ) {
         format!("{:08X}", report.title_id)
     } else {

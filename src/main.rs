@@ -197,14 +197,14 @@ enum Commands {
         /// Destination directory (the title-id tree lands underneath)
         dest: PathBuf,
         /// How much of the source partition to pack:
-        ///   `preserve-layout` (default) — walk the file tree, pack only
+        ///   `compact` (default) — rebuild a dense XDVDFS image first, then
+        ///   convert that compact image into GoD.
+        ///   `preserve-layout` — walk the file tree, pack only
         ///   through the highest used extent while preserving mastered
         ///   holes inside the XDVDFS layout.
         ///   `none` — pack everything from the start of the data partition
         ///   to the end of the source file.
-        ///   `compact` — rebuild a dense XDVDFS image first, then convert
-        ///   that compact image into GoD.
-        #[arg(long, value_parser = ["preserve-layout", "none", "compact"], default_value = "preserve-layout")]
+        #[arg(long, value_parser = ["compact", "preserve-layout", "none"], default_value = "compact")]
         trim: String,
         /// Print the parsed metadata (TitleID, MediaID, data_size, part_count)
         /// without writing anything.
@@ -1170,38 +1170,24 @@ fn run_extract(
             return;
         }
     };
-    let mut img = match fatxlib::xiso::XisoImage::open(file) {
+    let mut img = match fatxlib::iso::image::XisoImage::open(file) {
         Ok(i) => i,
         Err(e) => {
             cli_error(json, &format!("parse {}: {}", iso.display(), e));
             return;
         }
     };
-    let entries = match img.walk_files() {
-        Ok(v) => v,
+    let plan = match fatxlib::iso::extract::plan_extract(&mut img, keep_systemupdate) {
+        Ok(plan) => plan,
         Err(e) => {
             cli_error(json, &format!("walk {}: {}", iso.display(), e));
             return;
         }
     };
-
-    // Partition into kept vs skipped so totals reflect what will actually
-    // be written. Matches the policy the TUI uses on the upload path.
-    let (kept, skipped): (Vec<&fatxlib::xiso::XisoFile>, Vec<&fatxlib::xiso::XisoFile>) =
-        if keep_systemupdate {
-            (entries.iter().collect(), Vec::new())
-        } else {
-            entries.iter().partition(|e| !is_systemupdate(&e.path))
-        };
-    let total_files = kept.len();
-    let total_bytes: u64 = kept.iter().map(|f| f.size).sum();
-    let skipped_files = skipped.len();
-    let skipped_bytes: u64 = skipped.iter().map(|f| f.size).sum();
-
-    let layout = img
-        .layout()
-        .map(|l| format!("{} (0x{:08X})", l.name, l.offset))
-        .unwrap_or_else(|| format!("unknown @ 0x{:08X}", img.partition_offset()));
+    let total_files = plan.kept_files();
+    let total_bytes = plan.kept_bytes;
+    let skipped_files = plan.skipped_files();
+    let skipped_bytes = plan.skipped_bytes;
 
     if dry_run {
         if json {
@@ -1209,24 +1195,24 @@ fn run_extract(
                 "{}",
                 serde_json::json!({
                     "iso": iso.display().to_string(),
-                    "layout": layout,
+                    "layout": plan.layout,
                     "files": total_files,
                     "bytes": total_bytes,
                     "skipped_files": skipped_files,
                     "skipped_bytes": skipped_bytes,
-                    "entries": entries.iter().map(|e| {
+                    "entries": plan.entries.iter().map(|e| {
                         serde_json::json!({
                             "path": e.path,
                             "offset": e.offset,
                             "size": e.size,
-                            "skipped": !keep_systemupdate && is_systemupdate(&e.path),
+                            "skipped": plan.is_skipped(e, keep_systemupdate),
                         })
                     }).collect::<Vec<_>>(),
                 })
             );
         } else {
             println!("ISO:      {}", iso.display());
-            println!("Layout:   {}", layout);
+            println!("Layout:   {}", plan.layout);
             println!("Files:    {} ({})", total_files, format_size(total_bytes));
             if skipped_files > 0 {
                 println!(
@@ -1236,8 +1222,8 @@ fn run_extract(
                 );
             }
             println!();
-            for e in &entries {
-                let s = !keep_systemupdate && is_systemupdate(&e.path);
+            for e in &plan.entries {
+                let s = plan.is_skipped(e, keep_systemupdate);
                 let tag = if s { "skip " } else { "keep " };
                 println!(
                     "  {} {:48}  @0x{:010X}  {}",
@@ -1263,7 +1249,7 @@ fn run_extract(
     let mut bytes_done: u64 = 0;
     let last_progress = std::cell::Cell::new(Instant::now());
 
-    for e in &kept {
+    for e in &plan.kept {
         let normalized = e.path.replace('\\', "/");
         let local = dest.join(&normalized);
         if let Some(parent) = local.parent()
@@ -1352,15 +1338,6 @@ fn run_extract(
     }
 }
 
-fn is_systemupdate(image_path: &str) -> bool {
-    image_path
-        .trim_start_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .eq_ignore_ascii_case("$SystemUpdate")
-}
-
 fn short_name(p: &str) -> &str {
     p.rsplit('/').next().unwrap_or(p)
 }
@@ -1380,9 +1357,9 @@ fn run_god(
     use std::time::Instant;
 
     let trim_mode = match trim {
-        "preserve-layout" => fatxlib::iso2god::TrimMode::PreserveLayout,
-        "none" => fatxlib::iso2god::TrimMode::None,
-        "compact" => fatxlib::iso2god::TrimMode::Compact,
+        "preserve-layout" => fatxlib::iso::god::TrimMode::PreserveLayout,
+        "none" => fatxlib::iso::god::TrimMode::None,
+        "compact" => fatxlib::iso::god::TrimMode::Compact,
         other => {
             cli_error(json, &format!("invalid --trim {:?}", other));
             return;
@@ -1391,12 +1368,12 @@ fn run_god(
 
     // Catalog-fill the game title from the dry-run report, unless the
     // caller passed --game-title explicitly.
-    let mut dry_opts = fatxlib::iso2god::ConvertOptions {
+    let mut dry_opts = fatxlib::iso::god::ConvertOptions {
         trim: trim_mode,
         dry_run: true,
         ..Default::default()
     };
-    let report = match fatxlib::iso2god::convert_iso(iso, dest, &mut dry_opts) {
+    let report = match fatxlib::iso::god::convert_iso(iso, dest, &mut dry_opts) {
         Ok(r) => r,
         Err(e) => {
             cli_error(json, &format!("parse {}: {}", iso.display(), e));
@@ -1473,7 +1450,7 @@ fn run_god(
         }
     };
 
-    let mut opts = fatxlib::iso2god::ConvertOptions {
+    let mut opts = fatxlib::iso::god::ConvertOptions {
         trim: trim_mode,
         game_title: effective_title,
         dry_run: false,
@@ -1481,7 +1458,7 @@ fn run_god(
         should_abort: None,
     };
 
-    let result = fatxlib::iso2god::convert_iso(iso, dest, &mut opts);
+    let result = fatxlib::iso::god::convert_iso(iso, dest, &mut opts);
     if !json {
         eprint!("\r{:80}\r", "");
     }

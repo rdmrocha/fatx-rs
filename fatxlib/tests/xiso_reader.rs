@@ -5,7 +5,7 @@ mod common;
 use std::fs::File;
 use std::io::Cursor;
 
-use fatxlib::xiso::XisoImage;
+use fatxlib::iso::image::XisoImage;
 
 // ---------------------------------------------------------------------------
 // Negative paths — always runnable

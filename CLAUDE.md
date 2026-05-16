@@ -84,7 +84,7 @@ cargo run -p fatxlib --example check_profile -- /path/to/profile-file
 - Commit and push at each milestone (working feature, major fix, etc.)
 
 ### XISO / disc-image support
-- `fatxlib::xiso` wraps `xdvdfs` (sync feature, no async runtime) and exposes `XisoImage::{open, walk_files, read_into, file_reader, read_at}` plus a `LAYOUTS` table for raw / XGD1 / XGD2 / XGD3 pre-partition offsets.
+- `fatxlib::iso::image` wraps `xdvdfs` (sync feature, no async runtime) and exposes `XisoImage::{open, walk_files, read_into, file_reader, read_at}` plus a `LAYOUTS` table for raw / XGD1 / XGD2 / XGD3 pre-partition offsets.
 - TUI upload (`u`) sniffs every local file with `XisoImage::open`. On a hit, the user is prompted **Extract contents (Y/n)** — default extracts via `IoCmd::ExtractXiso`, `n` falls back to raw `WriteFile`. Extraction streams each entry through `XisoFileReader` → `FatxVolume::create_file_from_reader`, which keeps the working set at one cluster regardless of image size.
 - Useful because Aurora / FreeStyle Dash / XBMC4XBOX scan the drive for loose `default.xex` / `default.xbe` and launch them directly; STFS-wrapped GoD packaging is **not** required for those dashboards.
 

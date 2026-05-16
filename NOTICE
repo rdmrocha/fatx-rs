@@ -53,7 +53,7 @@ Local adaptations made when vendoring:
   - anyhow::Error replaced with fatxlib's FatxError so callers see one
     error type across the library.
   - Intra-crate imports rewritten from `crate::god` / `crate::executable`
-    to `crate::iso2god::god` / `crate::iso2god::executable`.
+    to `crate::iso::god` / `crate::executable`.
   - The upstream `src/game_list/` (~5 KLOC compiled-in title catalog)
     was NOT vendored; fatxlib's existing `titles` module covers the
     same purpose with broader data.

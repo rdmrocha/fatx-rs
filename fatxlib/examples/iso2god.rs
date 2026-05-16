@@ -1,13 +1,12 @@
-//! Minimal CLI wrapper around [`fatxlib::iso2god::convert_iso`]. Argument
+//! Minimal CLI wrapper around [`fatxlib::iso::god::convert_iso`]. Argument
 //! shape:
 //!
 //! ```text
 //! iso2god [--trim MODE] [--dry-run] [--game-title TITLE] <source.iso> <dest_dir>
 //! ```
 //!
-//! `--trim preserve-layout` is the default. Pass `--trim none` to convert
-//! the full source partition, or `--trim compact` to rebuild a dense XDVDFS
-//! image first.
+//! `--trim compact` is the default. Pass `--trim preserve-layout` to retain
+//! mastered holes, or `--trim none` to convert the full source partition.
 //!
 //! `-j N` isn't exposed; `convert_iso` is single-threaded.
 
@@ -16,18 +15,18 @@ use std::path::PathBuf;
 use std::process;
 use std::time::Instant;
 
-use fatxlib::iso2god::{ConvertOptions, TrimMode, convert_iso};
+use fatxlib::iso::god::{ConvertOptions, TrimMode, convert_iso};
 
 fn usage_and_exit() -> ! {
     eprintln!(
-        "usage: iso2god [--trim preserve-layout|none|compact] [--dry-run] [--game-title TITLE] <source.iso> <dest_dir>"
+        "usage: iso2god [--trim compact|preserve-layout|none] [--dry-run] [--game-title TITLE] <source.iso> <dest_dir>"
     );
     process::exit(2);
 }
 
 fn main() {
     let mut args = env::args().skip(1);
-    let mut trim = TrimMode::PreserveLayout;
+    let mut trim = TrimMode::Compact;
     let mut dry_run = false;
     let mut game_title: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
