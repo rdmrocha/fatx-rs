@@ -1,7 +1,7 @@
 [package]
 name = "fatxlib"
 version = "0.3.0"
-edition = "2021"
+edition = "2024"
 description = "A Rust library for reading and writing Xbox FATX file systems"
 license = "Apache-2.0"
 repository = "https://github.com/rdmrocha/xtafkit"
@@ -13,15 +13,15 @@ bitflags = "2"
 time = "0.3"
 log = "0.4"
 libc = "0.2"
-phf = "0.11"
-hmac = "0.12"
-sha1 = "0.10"
+phf = "0.13"
+hmac = "0.13"
+sha1 = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nix = { version = "0.29", features = ["fs", "ioctl"] }
+nix = { version = "0.31", features = ["fs", "ioctl"] }
 
 [build-dependencies]
-phf_codegen = "0.11"
+phf_codegen = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
