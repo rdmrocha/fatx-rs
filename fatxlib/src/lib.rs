@@ -34,6 +34,7 @@ pub mod stfs;
 pub mod titles;
 pub mod types;
 pub mod volume;
+pub mod xiso;
 pub mod xuids;
 
 pub use error::{FatxError, Result};

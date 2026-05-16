@@ -52,6 +52,9 @@ pub enum FatxError {
 
     #[error("No FATX partition found at the expected offset")]
     NoPartitionFound,
+
+    #[error("{0}")]
+    Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, FatxError>;
