@@ -10,7 +10,7 @@
 #   bash install.sh
 #
 # Options:
-#   XTAFKIT_VERSION=v0.3.0 bash install.sh           # install a specific version
+#   XTAFKIT_VERSION=v1.0.0 bash install.sh           # install a specific version
 #   XTAFKIT_INSTALL_DIR=~/.local/bin bash install.sh  # custom install directory
 
 set -e

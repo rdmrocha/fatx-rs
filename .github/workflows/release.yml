@@ -96,10 +96,10 @@ jobs:
         include:
           - target: x86_64-apple-darwin
             os: macos-14
-            name: fatx-macos-x86_64
+            name: xtafkit-macos-x86_64
           - target: aarch64-apple-darwin
             os: macos-14
-            name: fatx-macos-arm64
+            name: xtafkit-macos-arm64
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -133,7 +133,7 @@ jobs:
       - name: Package binary
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.name }}.tar.gz fatx
+          tar czf ../../../${{ matrix.name }}.tar.gz xtafkit
           cd ../../..
 
       - name: Upload artifact
@@ -154,9 +154,31 @@ jobs:
         with:
           path: artifacts
 
+      # Pull just the section matching this tag's version out of CHANGELOG.md.
+      # If a matching section isn't found we leave release_notes.md empty,
+      # which lets `generate_release_notes` fall back to GitHub's auto notes.
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Extracting notes for version $VERSION from CHANGELOG.md"
+          awk -v ver="$VERSION" '
+            /^## \[/ {
+              if (in_section) exit
+              if (index($0, "[" ver "]")) { in_section = 1; next }
+            }
+            in_section { print }
+          ' CHANGELOG.md > release_notes.md
+          if [ -s release_notes.md ]; then
+            echo "Found $(wc -l < release_notes.md) lines of release notes."
+          else
+            echo "No matching section for $VERSION; release will use auto-generated notes only."
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           generate_release_notes: true
+          body_path: release_notes.md
           files: |
             artifacts/**/*.tar.gz
