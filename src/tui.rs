@@ -18,10 +18,17 @@
 //!   m                 Create new directory (mkdir)
 //!   D                 Delete selected file/directory
 //!   r                 Rename selected file/directory
-//!   R                 Resolve title name from STFS header (when inside
-//!                     `/Content/<XUID>`; entries needing resolution are
-//!                     marked with `?`). Result is cached at
-//!                     `~/.config/fatx-rs/user_titles.txt`.
+//!   R                 Resolve names from STFS headers (entries needing
+//!                     resolution are marked with `?`).
+//!                     - Inside `/Content/<XUID>`: resolve the selected
+//!                       title-ID folder; cached at
+//!                       `~/.config/fatx-rs/user_titles.txt`.
+//!                     - Inside an Arcade / XNA / Marketplace / Installer
+//!                       folder: bulk-scan every file in the current
+//!                       directory; cached at
+//!                       `~/.config/fatx-rs/user_files.txt`.
+//!   s                 Toggle sort order between by-name and by-id; also
+//!                     flips which side of the bracket is shown first.
 //!   i                 Show volume info
 //!   c                 Clean up macOS metadata from current directory
 //!   Esc               Cancel a running I/O operation (when busy) / quit (when idle)
@@ -58,14 +65,51 @@ use fatxlib::volume::FatxVolume;
 struct DisplayEntry {
     /// Raw on-disk filename. Used for navigation and download paths.
     name: String,
-    /// Slot-aware human-formatted name (e.g. `"Halo 3 [4D5307E6]"`).
-    /// Used purely for the listing UI; never for path operations.
-    display_name: String,
+    /// Resolved name (just the name part, without brackets) when the slot
+    /// resolver had a match. `None` for unresolved or non-resolvable entries.
+    resolved: Option<String>,
     is_dir: bool,
     size: u64,
     modified: String,
     attributes: String,
     first_cluster: u32,
+}
+
+impl DisplayEntry {
+    /// Whether this entry has a slot-resolved name available.
+    fn is_resolved(&self) -> bool {
+        self.resolved.is_some()
+    }
+
+    /// Render the entry's label for the given sort mode.
+    /// `ByName` shows `<resolved> [<raw>]`; `ById` shows `<raw> [<resolved>]`.
+    /// Unresolved entries always render as just the raw name.
+    fn label(&self, mode: SortMode) -> String {
+        match (&self.resolved, mode) {
+            (Some(name), SortMode::ByName) => format!("{} [{}]", name, self.name),
+            (Some(name), SortMode::ById) => format!("{} [{}]", self.name, name),
+            (None, _) => self.name.clone(),
+        }
+    }
+
+    /// Primary sort key for the given mode.
+    fn sort_key<'a>(&'a self, mode: SortMode) -> std::borrow::Cow<'a, str> {
+        match (&self.resolved, mode) {
+            (Some(name), SortMode::ByName) => std::borrow::Cow::Borrowed(name),
+            (_, SortMode::ById) => std::borrow::Cow::Borrowed(&self.name),
+            (None, SortMode::ByName) => std::borrow::Cow::Borrowed(&self.name),
+        }
+    }
+}
+
+/// How to order the directory listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortMode {
+    /// `<resolved-name> [<raw-id>]`, ordered alphabetically by resolved
+    /// name (falling back to raw for unresolved entries).
+    ByName,
+    /// `<raw-id> [<resolved-name>]`, ordered by the on-disk raw value.
+    ById,
 }
 
 // ===========================================================================
@@ -94,6 +138,11 @@ enum IoCmd {
     },
     ResolveTitle {
         /// Path to a title-ID folder (e.g. `/Content/<XUID>/<TitleID>`).
+        path: String,
+    },
+    /// Bulk-scan every STFS file directly inside `path` and cache results.
+    /// Used inside Arcade / XNA / Marketplace / Installer folders.
+    ScanFolderFiles {
         path: String,
     },
     Delete {
@@ -183,6 +232,8 @@ struct App {
     cancel_flag: Arc<AtomicBool>,
     /// Pending cleanup paths awaiting user confirmation.
     pending_cleanup: Vec<(String, bool, u64)>,
+    /// Current listing sort order. Toggleable with `s`.
+    sort_mode: SortMode,
 }
 
 /// Unescape shell-style backslash escapes in a path string.
@@ -227,6 +278,7 @@ impl App {
             is_busy: false,
             cancel_flag,
             pending_cleanup: Vec::new(),
+            sort_mode: SortMode::ByName,
         }
     }
 
@@ -255,6 +307,20 @@ impl App {
             format!("{}/{}", self.cwd, name)
         }
     }
+
+    /// Sort `self.entries` in place using the active [`SortMode`].
+    /// Directories always come first; the mode's `sort_key` is the secondary
+    /// criterion.
+    fn resort_entries(&mut self) {
+        let mode = self.sort_mode;
+        self.entries.sort_by(|a, b| {
+            b.is_dir.cmp(&a.is_dir).then_with(|| {
+                a.sort_key(mode)
+                    .to_lowercase()
+                    .cmp(&b.sort_key(mode).to_lowercase())
+            })
+        });
+    }
 }
 
 // ===========================================================================
@@ -282,7 +348,7 @@ fn io_worker(
 
                 match vol.read_directory(entry.first_cluster) {
                     Ok(entries) => {
-                        let mut display: Vec<DisplayEntry> = entries
+                        let display: Vec<DisplayEntry> = entries
                             .iter()
                             .map(|e| {
                                 let attr = format!(
@@ -305,14 +371,11 @@ fn io_worker(
                                     },
                                 );
                                 let raw = e.filename();
-                                let display_name = if e.is_directory() {
-                                    fatxlib::display::format_for_path(&path, &raw)
-                                } else {
-                                    raw.clone()
-                                };
+                                let resolved =
+                                    fatxlib::display::resolved_name_for_path(&path, &raw);
                                 DisplayEntry {
                                     name: raw,
-                                    display_name,
+                                    resolved,
                                     is_dir: e.is_directory(),
                                     size: e.file_size as u64,
                                     modified: e.write_datetime_str(),
@@ -322,12 +385,8 @@ fn io_worker(
                             })
                             .collect();
 
-                        display.sort_by(|a, b| {
-                            b.is_dir
-                                .cmp(&a.is_dir)
-                                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-                        });
-
+                        // The UI thread owns sort order — it can re-sort
+                        // on toggle without round-tripping to the worker.
                         let _ = resp_tx.send(IoResp::DirListing {
                             entries: display,
                             path,
@@ -647,6 +706,23 @@ fn io_worker(
                 let _ = resp_tx.send(resp);
             }
 
+            IoCmd::ScanFolderFiles { path } => {
+                let resp = match fatxlib::titles::dynamic::scan_folder_files(
+                    &mut vol, &path, true,
+                ) {
+                    Ok(summary) => IoResp::Done {
+                        message: format!(
+                            "Scanned: {} resolved, {} skipped",
+                            summary.resolved, summary.skipped
+                        ),
+                    },
+                    Err(e) => IoResp::Error {
+                        message: format!("Scan error: {}", e),
+                    },
+                };
+                let _ = resp_tx.send(resp);
+            }
+
             IoCmd::Flush => {
                 let _ = vol.flush();
                 let _ = resp_tx.send(IoResp::Flushed);
@@ -801,6 +877,7 @@ fn handle_io_response(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, resp: IoResp)
             let count = entries.len();
             app.cwd = path;
             app.entries = entries;
+            app.resort_entries();
             app.is_busy = false;
 
             if !app.entries.is_empty() {
@@ -1005,26 +1082,50 @@ fn handle_normal_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent)
             app.input_buffer.clear();
             app.input_mode = InputMode::MkdirName;
         }
-        KeyCode::Char('R') => {
-            // Only meaningful when the children of cwd are title-ID folders
-            // (i.e. we're inside `/Content/<XUID>`), and the selection is a
-            // directory whose display name didn't get resolved.
-            let slot = fatxlib::display::folder_slot(&app.cwd);
-            if slot != fatxlib::display::FolderSlot::TitleId {
-                app.set_error("Resolve only works inside Content/<XUID>");
-                return;
-            }
-            let Some(entry) = app.selected_entry() else {
-                return;
+        KeyCode::Char('s') => {
+            app.sort_mode = match app.sort_mode {
+                SortMode::ByName => SortMode::ById,
+                SortMode::ById => SortMode::ByName,
             };
-            if !entry.is_dir {
-                app.set_error("Select a title-ID folder to resolve");
-                return;
+            app.resort_entries();
+            let mode_label = match app.sort_mode {
+                SortMode::ByName => "by name",
+                SortMode::ById => "by ID",
+            };
+            app.set_status(&format!("Sorted {}", mode_label));
+        }
+        KeyCode::Char('R') => {
+            use fatxlib::display::{folder_slot, FolderSlot};
+            match folder_slot(&app.cwd) {
+                // Inside `/Content/<XUID>` → resolve the selected title-ID folder.
+                FolderSlot::TitleId => {
+                    let Some(entry) = app.selected_entry() else {
+                        return;
+                    };
+                    if !entry.is_dir {
+                        app.set_error("Select a title-ID folder to resolve");
+                        return;
+                    }
+                    let path = app.full_path(&entry.name);
+                    app.set_status("Reading STFS header...");
+                    let _ = cmd_tx.send(IoCmd::ResolveTitle { path });
+                    app.is_busy = true;
+                }
+                // Inside an Arcade/XNA/Marketplace/Installer folder →
+                // bulk-scan every file in the current directory.
+                FolderSlot::StfsFile => {
+                    app.set_status("Scanning STFS headers...");
+                    let _ = cmd_tx.send(IoCmd::ScanFolderFiles {
+                        path: app.cwd.clone(),
+                    });
+                    app.is_busy = true;
+                }
+                _ => {
+                    app.set_error(
+                        "R only works inside Content/<XUID> or an STFS content-type folder",
+                    );
+                }
             }
-            let path = app.full_path(&entry.name);
-            app.set_status("Reading STFS header...");
-            let _ = cmd_tx.send(IoCmd::ResolveTitle { path });
-            app.is_busy = true;
         }
         KeyCode::Char('D') => {
             if let Some(name) = app.selected_name() {
@@ -1217,17 +1318,22 @@ fn ui(frame: &mut Frame, app: &mut App) {
     frame.render_widget(header, chunks[0]);
 
     // -- File list --
-    // Children of cwd are in this slot — used to flag unresolved title-ID
-    // folders with a `?` so the user knows R can resolve them.
+    // Children of cwd are in this slot — used to flag unresolved entries
+    // with `?` so the user knows R can resolve them.
     let child_slot = fatxlib::display::folder_slot(&app.cwd);
+    let sort_mode = app.sort_mode;
     let items: Vec<ListItem> = app
         .entries
         .iter()
         .map(|e| {
             let icon = if e.is_dir { "📁" } else { "📄" };
-            let resolvable = child_slot == fatxlib::display::FolderSlot::TitleId
+            // Resolvable when the entry sits in a slot with an active
+            // resolver and we don't yet have a display name for it.
+            let resolvable = (child_slot == fatxlib::display::FolderSlot::TitleId
                 && e.is_dir
-                && e.display_name == e.name;
+                || child_slot == fatxlib::display::FolderSlot::StfsFile
+                    && !e.is_dir)
+                && !e.is_resolved();
             let marker = if resolvable { "?" } else { " " };
             let size_str = if e.is_dir {
                 "<DIR>".to_string()
@@ -1236,7 +1342,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             };
             let line = format!(
                 " {} {} {:<41} {:>10}  {}  {}",
-                icon, marker, e.display_name, size_str, e.modified, e.attributes,
+                icon, marker, e.label(sort_mode), size_str, e.modified, e.attributes,
             );
             let style = if e.is_dir {
                 Style::default().fg(Color::Cyan).bold()
@@ -1292,7 +1398,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         let help = if app.is_busy {
             " Esc: cancel "
         } else {
-            " d:download  u:upload  m:mkdir  D:delete  r:rename  R:resolve  i:info  c:cleanup  q:quit "
+            " d:download  u:upload  m:mkdir  D:delete  r:rename  R:resolve  s:sort  i:info  c:cleanup  q:quit "
         };
         let status_bar = Paragraph::new(format!(" {}", app.status))
             .style(style)

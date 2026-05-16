@@ -17,6 +17,7 @@
 //!     they survive across runs.
 
 pub mod dynamic;
+pub mod file_cache;
 pub mod user_cache;
 
 /// Which catalog(s) sourced this entry. Useful for UI hints like a `[BC]`

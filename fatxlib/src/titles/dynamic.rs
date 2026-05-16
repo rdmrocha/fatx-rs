@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use crate::error::Result;
 use crate::stfs::{self, MIN_HEADER_BYTES};
-use crate::titles::user_cache;
+use crate::titles::{file_cache, user_cache};
 use crate::volume::FatxVolume;
 
 /// Outcome of [`resolve_and_cache`]. Callers present this however they like
@@ -80,6 +80,86 @@ pub fn resolve_and_cache<T: Read + Write + Seek>(
     Ok(ResolveOutcome::Resolved {
         title_id,
         name,
+        saved_to,
+    })
+}
+
+/// Parse the STFS header of a single file and return its best display name.
+/// Returns `Ok(None)` when the file isn't a parseable STFS package.
+pub fn from_file<T: Read + Write + Seek>(
+    vol: &mut FatxVolume<T>,
+    file_path: &str,
+) -> Result<Option<String>> {
+    let entry = vol.resolve_path(file_path)?;
+    if entry.is_directory() {
+        return Ok(None);
+    }
+    if (entry.file_size as usize) < MIN_HEADER_BYTES {
+        return Ok(None);
+    }
+    let bytes = vol.read_file_range(&entry, 0, MIN_HEADER_BYTES)?;
+    if let Some(header) = stfs::parse_header(&bytes) {
+        let name = header.best_name();
+        if !name.is_empty() {
+            return Ok(Some(name.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Summary of a bulk file scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanSummary {
+    pub resolved: usize,
+    pub skipped: usize,
+    pub saved_to: Option<PathBuf>,
+}
+
+/// Read every immediate-child file in `content_type_folder_path` (e.g.
+/// `/Content/<XUID>/<TitleID>/000D0000`), parse each as STFS, and insert
+/// successful resolutions into the file cache. Persists to disk once at
+/// the end when `persist` is true.
+pub fn scan_folder_files<T: Read + Write + Seek>(
+    vol: &mut FatxVolume<T>,
+    content_type_folder_path: &str,
+    persist: bool,
+) -> Result<ScanSummary> {
+    let entry = vol.resolve_path(content_type_folder_path)?;
+    if !entry.is_directory() {
+        return Ok(ScanSummary {
+            resolved: 0,
+            skipped: 0,
+            saved_to: None,
+        });
+    }
+
+    let trimmed = content_type_folder_path.trim_end_matches('/');
+    let children = vol.read_directory(entry.first_cluster)?;
+    let mut resolved = 0;
+    let mut skipped = 0;
+    for child in &children {
+        if child.is_directory() {
+            continue;
+        }
+        let file_path = format!("{trimmed}/{}", child.filename());
+        match from_file(vol, &file_path)? {
+            Some(name) => {
+                file_cache::insert(file_path, name);
+                resolved += 1;
+            }
+            None => skipped += 1,
+        }
+    }
+
+    let saved_to = if persist && resolved > 0 {
+        file_cache::default_path().and_then(|p| file_cache::save_to(&p).ok().map(|_| p))
+    } else {
+        None
+    };
+
+    Ok(ScanSummary {
+        resolved,
+        skipped,
         saved_to,
     })
 }

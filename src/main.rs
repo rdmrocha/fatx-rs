@@ -1573,10 +1573,14 @@ fn print_entry(entry: &fatxlib::types::DirectoryEntry, parent_path: &str, long: 
 fn main() {
     let cli = Cli::parse();
 
-    // Best-effort load of user-resolved titles. Silent on failure — a missing
-    // file is normal on first run, and any error here shouldn't block CLI use.
+    // Best-effort load of user-resolved titles + files. Silent on failure —
+    // a missing file is normal on first run, and any error here shouldn't
+    // block CLI use.
     if let Some(cache_path) = fatxlib::titles::user_cache::default_path() {
         let _ = fatxlib::titles::user_cache::load_from(&cache_path);
+    }
+    if let Some(cache_path) = fatxlib::titles::file_cache::default_path() {
+        let _ = fatxlib::titles::file_cache::load_from(&cache_path);
     }
 
     // Mount and mkimage init their own loggers with their preferred format.
@@ -2399,6 +2403,118 @@ fn main() {
             no_save,
         }) => {
             let mut vol = open_volume(&device, &partition, offset, size);
+
+            // Dispatch by what kind of path was given. We use folder_slot of
+            // the path itself (which describes what slot its *children* are
+            // in) to identify whether the path is a title-ID folder, a
+            // content-type folder holding STFS files, or something else.
+            use fatxlib::display::{folder_slot, FolderSlot};
+            let slot_of_children = folder_slot(&path);
+            let entry = match vol.resolve_path(&path) {
+                Ok(e) => e,
+                Err(e) => {
+                    if json {
+                        println!("{}", serde_json::json!({"error": format!("{}", e)}));
+                        process::exit(0);
+                    }
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
+                }
+            };
+
+            // Bulk scan: path is a content-type folder of STFS files
+            if entry.is_directory() && slot_of_children == FolderSlot::StfsFile {
+                match fatxlib::titles::dynamic::scan_folder_files(
+                    &mut vol, &path, !no_save,
+                ) {
+                    Ok(summary) => {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "scan": {
+                                        "resolved": summary.resolved,
+                                        "skipped": summary.skipped,
+                                        "saved_to": summary.saved_to
+                                            .as_ref()
+                                            .map(|p| p.to_string_lossy().to_string()),
+                                    }
+                                })
+                            );
+                        } else {
+                            println!(
+                                "Scanned: {} resolved, {} skipped",
+                                summary.resolved, summary.skipped
+                            );
+                            if let Some(p) = summary.saved_to {
+                                println!("Saved to {}", p.display());
+                            }
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        if json {
+                            println!("{}", serde_json::json!({"error": format!("{}", e)}));
+                            process::exit(0);
+                        }
+                        eprintln!("Error: {}", e);
+                        process::exit(1);
+                    }
+                }
+            }
+
+            // Single file: path is an STFS file in a known content-type folder
+            if !entry.is_directory() {
+                match fatxlib::titles::dynamic::from_file(&mut vol, &path) {
+                    Ok(Some(name)) => {
+                        fatxlib::titles::file_cache::insert(path.clone(), name.clone());
+                        let saved_to = if !no_save {
+                            fatxlib::titles::file_cache::default_path().and_then(|p| {
+                                fatxlib::titles::file_cache::save_to(&p).ok().map(|_| p)
+                            })
+                        } else {
+                            None
+                        };
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "file": path,
+                                    "name": name,
+                                    "saved_to": saved_to
+                                        .as_ref()
+                                        .map(|p| p.to_string_lossy().to_string()),
+                                })
+                            );
+                        } else {
+                            println!("Resolved {} → {}", path, name);
+                            if let Some(p) = saved_to {
+                                println!("Saved to {}", p.display());
+                            }
+                        }
+                        return;
+                    }
+                    Ok(None) => {
+                        let msg = "file is not a parseable STFS package";
+                        if json {
+                            println!("{}", serde_json::json!({"error": msg}));
+                            process::exit(0);
+                        }
+                        eprintln!("Could not resolve: {}", msg);
+                        process::exit(2);
+                    }
+                    Err(e) => {
+                        if json {
+                            println!("{}", serde_json::json!({"error": format!("{}", e)}));
+                            process::exit(0);
+                        }
+                        eprintln!("Error: {}", e);
+                        process::exit(1);
+                    }
+                }
+            }
+
+            // Default: title-ID folder resolve (the original behavior).
             let outcome = fatxlib::titles::dynamic::resolve_and_cache(
                 &mut vol, &path, !no_save,
             );
