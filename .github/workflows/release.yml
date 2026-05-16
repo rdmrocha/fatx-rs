@@ -123,9 +123,18 @@ jobs:
       - name: Set version from tag
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.(.+)$ ]]; then
+            VERSION="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+            echo "Normalized 4+-segment tag version to Cargo semver: $VERSION"
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag version '$VERSION' is not a valid Cargo semver-compatible version."
+            exit 1
+          fi
           echo "Setting version to $VERSION"
           sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
           sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" fatxlib/Cargo.toml
+          cargo metadata --no-deps --format-version=1 >/dev/null
 
       - name: Build release binaries
         run: cargo build --release --workspace --target ${{ matrix.target }}
