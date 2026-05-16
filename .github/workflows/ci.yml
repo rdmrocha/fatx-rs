@@ -90,4 +90,4 @@ jobs:
         run: cargo build --release
 
       - name: Verify binary
-        run: ./target/release/fatx --version
+        run: ./target/release/xtafkit --version

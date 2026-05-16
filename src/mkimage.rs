@@ -1,6 +1,6 @@
-//! fatx mkimage: Create blank FATX/XTAF disk images for testing.
+//! xtafkit mkimage: Create blank FATX/XTAF disk images for testing.
 //!
-//! Generates a file-backed FATX volume that can be used with fatx
+//! Generates a file-backed FATX volume that can be used with xtafkit
 //! without needing a real Xbox hard drive.
 
 use std::fs::{File, OpenOptions};
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use fatxlib::types::*;
 use fatxlib::volume::FatxVolume;
-use rand::Rng;
+use rand::{RngExt, rng};
 
 /// Minimum image size: 2 MB (enough for superblock + FAT + a few clusters)
 const MIN_SIZE: u64 = 2 * 1024 * 1024;
@@ -137,8 +137,8 @@ pub fn run(args: MkimageArgs) {
     }
 
     println!("Done! Test with:");
-    println!("  fatx ls {} /", args.output.display());
-    println!("  sudo fatx mount {} -v", args.output.display());
+    println!("  xtafkit ls {} /", args.output.display());
+    println!("  xtafkit browse {}", args.output.display());
 }
 
 fn parse_size(s: &str) -> Result<u64, String> {
@@ -172,7 +172,7 @@ fn format_image(file: &mut File, size: u64, is_xtaf: bool, spc: u32) -> Result<(
         sb[0..4].copy_from_slice(b"FATX");
     }
 
-    let volume_id: u32 = rand::thread_rng().gen();
+    let volume_id: u32 = rng().random();
 
     if is_xtaf {
         sb[4..8].copy_from_slice(&volume_id.to_be_bytes());
