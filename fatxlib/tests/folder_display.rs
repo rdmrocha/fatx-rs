@@ -72,12 +72,44 @@ fn slot_detection() {
         folder_slot("/Content/0000000000000000/4D5307E6"),
         FolderSlot::ContentType
     );
+    // Content types that hold non-STFS files (e.g. 00001000 = Xbox 360 Title
+    // which is a multi-file install) → children are plain files.
     assert_eq!(
         folder_slot("/Content/0000000000000000/4D5307E6/00001000"),
         FolderSlot::File
     );
     assert_eq!(folder_slot("/"), FolderSlot::File);
     assert_eq!(folder_slot("/Photo"), FolderSlot::File);
+}
+
+#[test]
+fn slot_detection_stfs_file_content_types() {
+    // Children of a content-type folder that holds standalone STFS packages
+    // are STFS files we can read headers from.
+    for ct in ["00000002", "000B0000", "000D0000", "000E0000"] {
+        let path = format!("/Content/0000000000000000/4D5307E6/{ct}");
+        assert_eq!(folder_slot(&path), FolderSlot::StfsFile, "ct={ct}");
+    }
+}
+
+#[test]
+fn stfs_file_slot_format_unresolved_passes_through() {
+    // No entry in file cache yet → raw filename unchanged.
+    assert_eq!(
+        format_for_path("/Content/0000000000000000/4D5307E6/000D0000", "abc123def4"),
+        "abc123def4"
+    );
+}
+
+#[test]
+fn stfs_file_slot_format_resolved_via_file_cache() {
+    use fatxlib::titles::file_cache;
+    let path = "/Content/0000000000000000/4D5307E6/000D0000/halo_wars_pkg";
+    file_cache::insert(path.to_string(), "Halo Wars".to_string());
+    assert_eq!(
+        format_for_path("/Content/0000000000000000/4D5307E6/000D0000", "halo_wars_pkg"),
+        "Halo Wars [halo_wars_pkg]"
+    );
 }
 
 #[test]

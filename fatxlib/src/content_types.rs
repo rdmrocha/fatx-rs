@@ -3,6 +3,27 @@
 //! Sourced from <https://free60.org/System-Software/Formats/STFS/>. These are
 //! the values used in `Content/<XUID>/<TitleID>/<ContentType>/` folder names.
 
+/// Content-type IDs whose folders hold *standalone STFS packages* — one file
+/// per title/item — that can be resolved by parsing their headers
+/// individually. Keep this list narrow: multi-file installs (e.g. Games on
+/// Demand at 0x00001000) intentionally aren't here because their files
+/// aren't self-contained STFS packages.
+///
+/// Add new entries here as the need arises; the rest of the codebase picks
+/// them up automatically.
+pub const STFS_FILE_CONTENT_TYPES: &[u32] = &[
+    0x00000002, // Marketplace Content
+    0x000B0000, // Installer
+    0x000D0000, // Arcade Title
+    0x000E0000, // XNA
+];
+
+/// Whether `id`'s content-type folder holds standalone STFS files we can
+/// resolve per-file (vs. a multi-file install or non-STFS payload).
+pub fn contains_stfs_files(id: u32) -> bool {
+    STFS_FILE_CONTENT_TYPES.contains(&id)
+}
+
 /// Free60 STFS content type table.
 const CONTENT_TYPES: &[(u32, &str)] = &[
     (0x00000001, "Saved Game"),
