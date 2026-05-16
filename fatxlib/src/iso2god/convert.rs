@@ -11,20 +11,23 @@
 //! buffer makes an interposing reader pure overhead). A multi-threaded
 //! mode could land later as an opt-in flag.
 
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::error::{FatxError, Result};
+use crate::executable::TitleExecutionInfo;
 use crate::executable::TitleInfo;
 use crate::iso2god::god::{
     self, BLOCK_SIZE, BLOCKS_PER_PART, ConHeaderBuilder, ContentType, FileLayout, HashList,
     SUBPART_SIZE, SUBPARTS_PER_PART,
 };
 use crate::volume::FatxVolume;
-use tempfile::NamedTempFile;
-use xdvdfs::write::fs::XDVDFSFilesystem;
-use xdvdfs::write::img::{ProgressInfo, create_xdvdfs_image};
+use xdvdfs::layout::{DirectoryEntryTable, SECTOR_SIZE, VolumeDescriptor};
+use xdvdfs::write::dirtab::DirectoryEntryTableWriter;
+use xdvdfs::write::fs::{FileEntry, FileType, Filesystem, PathVec, XDVDFSFilesystem};
+use xdvdfs::write::sector::SectorAllocator;
 
 /// Buffer capacity for the metadata-pass source-ISO reader. 1 MiB —
 /// large enough that the default 8 KiB capacity's syscall tax disappears
@@ -32,7 +35,7 @@ use xdvdfs::write::img::{ProgressInfo, create_xdvdfs_image};
 pub const SOURCE_BUFFER_SIZE: usize = 1 << 20;
 
 /// Progress callback shape: `(stage, current, total)` where `stage` is one
-/// of `"compact"`, `"parts"`, `"mht"`, `"header"`.
+/// of `"parts"`, `"mht"`, `"header"`.
 pub type ProgressFn<'a> = &'a mut dyn FnMut(&str, u64, u64);
 
 /// How to size the output GoD relative to the source ISO.
@@ -48,8 +51,8 @@ pub enum TrimMode {
     /// the source file. Larger output, but useful when the directory tree
     /// is suspect.
     None,
-    /// Rebuild the XDVDFS image densely into a temporary file, then feed
-    /// that compact image through the normal GoD pipeline.
+    /// Rebuild the XDVDFS image densely as a virtual layout and stream
+    /// those bytes directly through the GoD pipeline.
     Compact,
 }
 
@@ -91,66 +94,361 @@ fn cancelled(op: &str) -> FatxError {
     FatxError::Other(format!("{op}: cancelled"))
 }
 
-fn build_compact_xiso(
-    source_iso: &Path,
-    mut progress: Option<ProgressFn<'_>>,
-    should_abort: Option<&dyn Fn() -> bool>,
-) -> Result<NamedTempFile> {
-    if let Some(abort) = should_abort
-        && abort()
-    {
-        return Err(cancelled("compact_xiso"));
+type SourceOffsetDevice = xdvdfs::blockdev::OffsetWrapper<File, std::io::Error>;
+type SourceFilesystem = XDVDFSFilesystem<std::io::Error, SourceOffsetDevice>;
+
+#[derive(Clone)]
+struct CompactTreeEntry {
+    dir: PathVec,
+    listing: Vec<FileEntry>,
+}
+
+enum CompactRegionData {
+    Bytes(Box<[u8]>),
+    Source { source_offset: u64 },
+}
+
+struct CompactRegion {
+    start: u64,
+    len: u64,
+    data: CompactRegionData,
+}
+
+struct CompactImagePlan {
+    data_size: u64,
+    regions: Vec<CompactRegion>,
+}
+
+struct CompactSource {
+    exe_info: TitleExecutionInfo,
+    content_type: ContentType,
+    partition_offset: u64,
+    plan: CompactImagePlan,
+}
+
+struct CompactImageReader<'a> {
+    source: File,
+    partition_offset: u64,
+    plan: &'a CompactImagePlan,
+    cursor: u64,
+}
+
+impl CompactSource {
+    fn open_reader(&self, source_iso: &Path) -> Result<CompactImageReader<'_>> {
+        Ok(CompactImageReader {
+            source: File::open(source_iso).map_err(FatxError::Io)?,
+            partition_offset: self.partition_offset,
+            plan: &self.plan,
+            cursor: 0,
+        })
     }
+}
 
-    let source = File::open(source_iso).map_err(FatxError::Io)?;
-    let source = xdvdfs::blockdev::OffsetWrapper::new(source)
-        .map_err(|e| FatxError::Other(format!("xdvdfs offset detect: {e:?}")))?;
-    let mut fs = XDVDFSFilesystem::new(source)
-        .ok_or_else(|| FatxError::Other("xdvdfs compact: could not open source image".into()))?;
+impl CompactImageReader<'_> {
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        buf.fill(0);
+        if buf.is_empty() {
+            return Ok(());
+        }
 
-    let temp = NamedTempFile::new().map_err(FatxError::Io)?;
-    let mut out = temp.reopen().map_err(FatxError::Io)?;
-    let mut total_files = 0u64;
-    let mut written_files = 0u64;
+        let end = offset.saturating_add(buf.len() as u64);
+        let mut idx = self
+            .plan
+            .regions
+            .partition_point(|region| region.start.saturating_add(region.len) <= offset);
 
-    create_xdvdfs_image(&mut fs, &mut out, |info| {
+        while idx < self.plan.regions.len() {
+            let region = &self.plan.regions[idx];
+            let region_end = region.start.saturating_add(region.len);
+            if region.start >= end {
+                break;
+            }
+
+            let overlap_start = offset.max(region.start);
+            let overlap_end = end.min(region_end);
+            if overlap_start < overlap_end {
+                let dst_start = (overlap_start - offset) as usize;
+                let dst_end = (overlap_end - offset) as usize;
+                let dst = &mut buf[dst_start..dst_end];
+                let src_offset = overlap_start - region.start;
+                match &region.data {
+                    CompactRegionData::Bytes(bytes) => {
+                        let src_start = src_offset as usize;
+                        let src_end = src_start + dst.len();
+                        dst.copy_from_slice(&bytes[src_start..src_end]);
+                    }
+                    CompactRegionData::Source { source_offset } => {
+                        self.source.seek(SeekFrom::Start(
+                            self.partition_offset + source_offset + src_offset,
+                        ))?;
+                        self.source.read_exact(dst)?;
+                    }
+                }
+            }
+            idx += 1;
+        }
+
+        Ok(())
+    }
+}
+
+impl Read for CompactImageReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cursor >= self.plan.data_size || buf.is_empty() {
+            return Ok(0);
+        }
+        let want = ((self.plan.data_size - self.cursor) as usize).min(buf.len());
+        self.read_at(self.cursor, &mut buf[..want])?;
+        self.cursor += want as u64;
+        Ok(want)
+    }
+}
+
+impl Seek for CompactImageReader<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let len = self.plan.data_size as i128;
+        let next = match pos {
+            SeekFrom::Start(pos) => pos as i128,
+            SeekFrom::Current(delta) => self.cursor as i128 + delta as i128,
+            SeekFrom::End(delta) => len + delta as i128,
+        };
+        if next < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "negative seek in CompactImageReader",
+            ));
+        }
+        self.cursor = next as u64;
+        Ok(self.cursor)
+    }
+}
+
+fn is_systemupdate_path(path: &str) -> bool {
+    path.trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("$SystemUpdate")
+}
+
+fn xdvdfs_other<E: std::fmt::Debug>(ctx: &str, err: E) -> FatxError {
+    FatxError::Other(format!("{ctx}: {err:?}"))
+}
+
+fn collect_source_file_offsets(
+    volume: VolumeDescriptor,
+    xiso: &mut SourceOffsetDevice,
+) -> Result<HashMap<String, u64>> {
+    let mut out = HashMap::new();
+    let entries = volume
+        .root_table
+        .file_tree(xiso)
+        .map_err(|e| xdvdfs_other("xdvdfs file_tree", e))?;
+    for (parent, entry) in entries {
+        if entry.node.dirent.is_directory() || entry.node.dirent.data.is_empty() {
+            continue;
+        }
+        let name = entry
+            .name_str::<std::io::Error>()
+            .map_err(|e| xdvdfs_other("xdvdfs bad filename", e))?;
+        let path = if parent.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", parent.trim_start_matches('/'), name)
+        };
+        out.insert(
+            path,
+            entry
+                .node
+                .dirent
+                .data
+                .offset::<std::io::Error>(0)
+                .map_err(|e| xdvdfs_other("xdvdfs bad offset", e))?,
+        );
+    }
+    Ok(out)
+}
+
+fn collect_compact_tree(
+    fs: &mut SourceFilesystem,
+    should_abort: Option<&dyn Fn() -> bool>,
+) -> Result<Vec<CompactTreeEntry>> {
+    let mut dirs = vec![PathVec::default()];
+    let mut out = Vec::new();
+
+    while let Some(dir) = dirs.pop() {
         if let Some(abort) = should_abort
             && abort()
         {
-            return;
+            return Err(cancelled("compact_tree"));
         }
-        if let Some(cb) = progress.as_deref_mut() {
-            match info {
-                ProgressInfo::FileCount(count) => {
-                    total_files = count as u64;
-                    cb("compact", 0, total_files.max(1));
-                }
-                ProgressInfo::FileAdded(_, _) => {
-                    written_files += 1;
-                    cb(
-                        "compact",
-                        written_files,
-                        total_files.max(written_files).max(1),
-                    );
-                }
-                ProgressInfo::FinishedPacking => {
-                    let total = total_files.max(written_files).max(1);
-                    cb("compact", total, total);
-                }
-                _ => {}
+
+        let mut listing =
+            <SourceFilesystem as Filesystem<File, std::io::Error>>::read_dir(fs, &dir)
+                .map_err(|e| FatxError::Other(format!("xdvdfs compact read_dir: {e}")))?;
+        listing.retain(|entry| {
+            let path = PathVec::from_base(&dir, &entry.name).as_string();
+            !is_systemupdate_path(&path)
+        });
+
+        for entry in &listing {
+            if matches!(entry.file_type, FileType::Directory) {
+                dirs.push(PathVec::from_base(&dir, &entry.name));
             }
         }
-    })
-    .map_err(|e| FatxError::Other(format!("xdvdfs compact: {e}")))?;
 
+        out.push(CompactTreeEntry { dir, listing });
+    }
+
+    Ok(out)
+}
+
+fn build_compact_dirent_tables(
+    tree: &[CompactTreeEntry],
+) -> Result<BTreeMap<PathVec, DirectoryEntryTableWriter>> {
+    let mut dirent_tables: BTreeMap<PathVec, DirectoryEntryTableWriter> = BTreeMap::new();
+
+    for entry in tree.iter().rev() {
+        let mut dirtab = DirectoryEntryTableWriter::default();
+        for child in &entry.listing {
+            match child.file_type {
+                FileType::Directory => {
+                    let child_path = PathVec::from_base(&entry.dir, &child.name);
+                    let dir_size = dirent_tables
+                        .get(&child_path)
+                        .ok_or_else(|| {
+                            FatxError::Other(format!(
+                                "xdvdfs compact: missing dirtab for {}",
+                                child_path.as_string()
+                            ))
+                        })?
+                        .dirtab_size();
+                    dirtab
+                        .add_dir::<std::io::Error>(&child.name, dir_size)
+                        .map_err(|e| xdvdfs_other("xdvdfs add_dir", e))?;
+                }
+                FileType::File => {
+                    let size = child
+                        .len
+                        .try_into()
+                        .map_err(|_| FatxError::Other(format!("file too large: {}", child.len)))?;
+                    dirtab
+                        .add_file::<std::io::Error>(&child.name, size)
+                        .map_err(|e| xdvdfs_other("xdvdfs add_file", e))?;
+                }
+            }
+        }
+        dirtab
+            .compute_size::<std::io::Error>()
+            .map_err(|e| xdvdfs_other("xdvdfs compute_size", e))?;
+        dirent_tables.insert(entry.dir.clone(), dirtab);
+    }
+
+    Ok(dirent_tables)
+}
+
+fn build_compact_source(
+    source_iso: &Path,
+    should_abort: Option<&dyn Fn() -> bool>,
+) -> Result<CompactSource> {
     if let Some(abort) = should_abort
         && abort()
     {
-        return Err(cancelled("compact_xiso"));
+        return Err(cancelled("compact_source"));
     }
 
-    out.sync_all().map_err(FatxError::Io)?;
-    Ok(temp)
+    let file = File::open(source_iso).map_err(FatxError::Io)?;
+    let mut xiso = xdvdfs::blockdev::OffsetWrapper::new(file)
+        .map_err(|e| xdvdfs_other("xdvdfs offset detect", e))?;
+    let volume =
+        xdvdfs::read::read_volume(&mut xiso).map_err(|e| xdvdfs_other("xdvdfs read_volume", e))?;
+    let title_info = TitleInfo::from_image(&mut xiso, volume)?;
+    let exe_info = title_info.execution_info.clone();
+    let content_type = title_info.content_type;
+    let partition_offset = {
+        xiso.seek(SeekFrom::Start(0)).map_err(FatxError::Io)?;
+        xiso.get_mut().stream_position().map_err(FatxError::Io)?
+    };
+
+    let file_offsets = collect_source_file_offsets(volume, &mut xiso)?;
+    let mut fs = XDVDFSFilesystem::new(xiso)
+        .ok_or_else(|| FatxError::Other("xdvdfs compact: could not open source image".into()))?;
+    let tree = collect_compact_tree(&mut fs, should_abort)?;
+    let dirent_tables = build_compact_dirent_tables(&tree)?;
+
+    let mut dir_sectors = BTreeMap::new();
+    let mut allocator = SectorAllocator::default();
+    let (root_path, root_dirtab) = dirent_tables
+        .first_key_value()
+        .ok_or_else(|| FatxError::Other("xdvdfs compact: empty directory tree".into()))?;
+    let root_sector = allocator.allocate_contiguous(root_dirtab.dirtab_size() as u64);
+    let root_table = DirectoryEntryTable::new(root_dirtab.dirtab_size(), root_sector);
+    dir_sectors.insert(root_path.clone(), root_sector as u64);
+
+    let volume_bytes = VolumeDescriptor::new(root_table)
+        .serialize::<std::io::Error>()
+        .map_err(|e| xdvdfs_other("xdvdfs serialize volume", e))?;
+    let mut regions = vec![CompactRegion {
+        start: 32 * SECTOR_SIZE as u64,
+        len: volume_bytes.len() as u64,
+        data: CompactRegionData::Bytes(Box::from(volume_bytes)),
+    }];
+
+    for (path, dirtab) in dirent_tables {
+        if let Some(abort) = should_abort
+            && abort()
+        {
+            return Err(cancelled("compact_source"));
+        }
+
+        let sector = *dir_sectors
+            .get(&path)
+            .ok_or_else(|| FatxError::Other(format!("missing sector for {}", path.as_string())))?;
+        let repr = dirtab
+            .disk_repr::<std::io::Error>(&mut allocator)
+            .map_err(|e| xdvdfs_other("xdvdfs disk_repr", e))?;
+        regions.push(CompactRegion {
+            start: sector * SECTOR_SIZE as u64,
+            len: repr.entry_table.len() as u64,
+            data: CompactRegionData::Bytes(repr.entry_table),
+        });
+
+        for entry in repr.file_listing {
+            let child_path = PathVec::from_base(&path, &entry.name);
+            if entry.is_dir {
+                dir_sectors.insert(child_path, entry.sector);
+                continue;
+            }
+
+            let logical_path = child_path.as_string();
+            let logical_path = logical_path.trim_start_matches('/').to_string();
+            let source_offset = *file_offsets.get(&logical_path).ok_or_else(|| {
+                FatxError::Other(format!(
+                    "xdvdfs compact: missing source offset for {}",
+                    logical_path
+                ))
+            })?;
+            regions.push(CompactRegion {
+                start: entry.sector * SECTOR_SIZE as u64,
+                len: entry.size,
+                data: CompactRegionData::Source { source_offset },
+            });
+        }
+    }
+
+    regions.sort_by_key(|region| region.start);
+    let data_size = regions
+        .iter()
+        .map(|region| region.start + region.len)
+        .max()
+        .unwrap_or(0);
+
+    Ok(CompactSource {
+        exe_info,
+        content_type,
+        partition_offset,
+        plan: CompactImagePlan { data_size, regions },
+    })
 }
 
 /// Convert an Xbox 360 / original-Xbox ISO into a Games-on-Demand package.
@@ -167,16 +465,111 @@ pub fn convert_iso<'a>(
     opts: &'a mut ConvertOptions<'a>,
 ) -> Result<ConvertReport> {
     if matches!(opts.trim, TrimMode::Compact) {
-        let compact =
-            build_compact_xiso(source_iso, opts.progress.as_deref_mut(), opts.should_abort)?;
-        let mut forwarded_opts = ConvertOptions {
-            trim: TrimMode::PreserveLayout,
-            game_title: opts.game_title,
-            dry_run: opts.dry_run,
-            progress: None,
-            should_abort: opts.should_abort,
+        let compact = build_compact_source(source_iso, opts.should_abort)?;
+        let block_count = compact.plan.data_size.div_ceil(god::BLOCK_SIZE);
+        let part_count = block_count.div_ceil(god::BLOCKS_PER_PART);
+        let report = ConvertReport {
+            title_id: compact.exe_info.title_id,
+            media_id: compact.exe_info.media_id,
+            content_type: compact.content_type,
+            part_count,
+            block_count,
+            data_size: compact.plan.data_size,
         };
-        return convert_iso(compact.path(), dest_dir, &mut forwarded_opts);
+        if opts.dry_run {
+            return Ok(report);
+        }
+
+        let file_layout = FileLayout::new(dest_dir, &compact.exe_info, compact.content_type);
+        ensure_empty_dir(&file_layout.data_dir_path())?;
+
+        if let Some(cb) = opts.progress.as_deref_mut() {
+            cb("parts", 0, part_count);
+        }
+
+        for part_index in 0..part_count {
+            if let Some(abort) = opts.should_abort
+                && abort()
+            {
+                return Err(FatxError::Other("convert_iso: cancelled".to_string()));
+            }
+            let part_path = file_layout.part_file_path(part_index);
+            let part_file = File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&part_path)
+                .map_err(FatxError::Io)?;
+            let part_file = BufWriter::with_capacity(SOURCE_BUFFER_SIZE, part_file);
+            let remaining_bytes = part_payload_bytes(compact.plan.data_size, part_index);
+            let iso_data_volume = compact.open_reader(source_iso)?;
+
+            god::write_part(iso_data_volume, part_index, remaining_bytes, part_file)?;
+
+            if let Some(cb) = opts.progress.as_deref_mut() {
+                cb("parts", part_index + 1, part_count);
+            }
+        }
+
+        if let Some(cb) = opts.progress.as_deref_mut() {
+            cb("mht", 0, part_count);
+        }
+
+        let mut mht = read_part_mht(&file_layout, part_count - 1)?;
+        for prev_part_index in (0..part_count - 1).rev() {
+            if let Some(abort) = opts.should_abort
+                && abort()
+            {
+                return Err(FatxError::Other("convert_iso: cancelled".to_string()));
+            }
+            let mut prev_mht = read_part_mht(&file_layout, prev_part_index)?;
+            prev_mht.add_hash(&mht.digest());
+            write_part_mht(&file_layout, prev_part_index, &prev_mht)?;
+            mht = prev_mht;
+
+            if let Some(cb) = opts.progress.as_deref_mut() {
+                cb("mht", part_count - prev_part_index, part_count);
+            }
+        }
+
+        let last_part_size = fs::metadata(file_layout.part_file_path(part_count - 1))
+            .map_err(FatxError::Io)?
+            .len();
+
+        if let Some(cb) = opts.progress.as_deref_mut() {
+            cb("header", 0, 1);
+        }
+
+        let mut con_header = ConHeaderBuilder::new()
+            .with_execution_info(&compact.exe_info)
+            .with_block_counts(block_count as u32, 0)
+            .with_data_parts_info(
+                part_count as u32,
+                last_part_size + (part_count - 1) * god::BLOCK_SIZE * 0xa290,
+            )
+            .with_content_type(compact.content_type)
+            .with_mht_hash(&mht.digest());
+
+        if let Some(game_title) = opts.game_title {
+            con_header = con_header.with_game_title(game_title);
+        }
+
+        let con_header = con_header.finalize();
+        let mut con_header_file = File::options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(file_layout.con_header_file_path())
+            .map_err(FatxError::Io)?;
+        con_header_file
+            .write_all(&con_header)
+            .map_err(FatxError::Io)?;
+
+        if let Some(cb) = opts.progress.as_deref_mut() {
+            cb("header", 1, 1);
+        }
+
+        return Ok(report);
     }
 
     let source_iso_file_meta = fs::metadata(source_iso).map_err(FatxError::Io)?;
@@ -428,16 +821,139 @@ where
     T: Read + Seek + Write,
 {
     if matches!(opts.trim, TrimMode::Compact) {
-        let compact =
-            build_compact_xiso(source_iso, opts.progress.as_deref_mut(), opts.should_abort)?;
-        let mut forwarded_opts = ConvertOptions {
-            trim: TrimMode::PreserveLayout,
-            game_title: opts.game_title,
-            dry_run: opts.dry_run,
-            progress: None,
-            should_abort: opts.should_abort,
+        let compact = build_compact_source(source_iso, opts.should_abort)?;
+        let block_count = compact.plan.data_size.div_ceil(BLOCK_SIZE);
+        let part_count = block_count.div_ceil(BLOCKS_PER_PART);
+        let report = ConvertReport {
+            title_id: compact.exe_info.title_id,
+            media_id: compact.exe_info.media_id,
+            content_type: compact.content_type,
+            part_count,
+            block_count,
+            data_size: compact.plan.data_size,
         };
-        return convert_iso_to_fatx(compact.path(), vol, dest_dir, &mut forwarded_opts);
+        if opts.dry_run {
+            return Ok(report);
+        }
+        if part_count == 0 {
+            return Err(FatxError::Other(
+                "convert_iso_to_fatx: source has no data to convert".to_string(),
+            ));
+        }
+
+        let title_id_str = format!("{:08X}", compact.exe_info.title_id);
+        let content_type_str = format!("{:08X}", compact.content_type as u32);
+        let media_id_str = match compact.content_type {
+            ContentType::GamesOnDemand => format!("{:08X}", compact.exe_info.media_id),
+            ContentType::XboxOriginal => format!("{:08X}", compact.exe_info.title_id),
+        };
+        let dest_root = dest_dir.trim_end_matches('/');
+        let title_dir = format!("{}/{}", dest_root, title_id_str);
+        let content_dir = format!("{}/{}", title_dir, content_type_str);
+        let con_header_path = format!("{}/{}", content_dir, media_id_str);
+        let data_dir = format!("{}/{}.data", content_dir, media_id_str);
+
+        ensure_fatx_dir(vol, &title_dir)?;
+        ensure_fatx_dir(vol, &content_dir)?;
+        ensure_fatx_dir(vol, &data_dir)?;
+
+        if let Some(cb) = opts.progress.as_deref_mut() {
+            cb("parts", 0, part_count);
+        }
+
+        let mut part_buf = vec![0u8; MAX_PART_BYTES];
+        let mut master_lists: Vec<HashList> = Vec::with_capacity(part_count as usize);
+        let mut last_part_size: u64 = 0;
+
+        for part_index in 0..part_count {
+            if let Some(abort) = opts.should_abort
+                && abort()
+            {
+                return Err(FatxError::Other(
+                    "convert_iso_to_fatx: cancelled".to_string(),
+                ));
+            }
+
+            let remaining_bytes = part_payload_bytes(compact.plan.data_size, part_index);
+            let mut iso = compact.open_reader(source_iso)?;
+            let (len, master) =
+                fill_part_buf(&mut iso, part_index, remaining_bytes, &mut part_buf)?;
+            let part_path = format!("{}/Data{:04}", data_dir, part_index);
+            let reader = Cursor::new(&part_buf[..len]);
+
+            let mut outer = opts.progress.take();
+            let part_idx_now = part_index;
+            let part_count_now = part_count;
+            {
+                let mut inner = |bytes: u64, total: u64| {
+                    if let Some(cb) = outer.as_deref_mut() {
+                        let stage = format!("part {}/{}", part_idx_now + 1, part_count_now);
+                        cb(&stage, bytes, total);
+                    }
+                };
+                vol.create_file_from_reader(&part_path, len as u64, reader, Some(&mut inner))?;
+            }
+            opts.progress = outer;
+
+            master_lists.push(master);
+            last_part_size = len as u64;
+
+            if let Some(cb) = opts.progress.as_deref_mut() {
+                cb("parts", part_index + 1, part_count);
+            }
+        }
+        let _ = vol.flush();
+
+        if let Some(cb) = opts.progress.as_deref_mut() {
+            cb("mht", 0, part_count);
+        }
+        for i in (0..(part_count as usize).saturating_sub(1)).rev() {
+            if let Some(abort) = opts.should_abort
+                && abort()
+            {
+                return Err(FatxError::Other(
+                    "convert_iso_to_fatx: cancelled".to_string(),
+                ));
+            }
+            let next_digest = master_lists[i + 1].digest();
+            master_lists[i].add_hash(&next_digest);
+            if let Some(cb) = opts.progress.as_deref_mut() {
+                cb("mht", (part_count as u64) - 1 - (i as u64), part_count);
+            }
+        }
+
+        for (i, master) in master_lists.iter().enumerate() {
+            let part_path = format!("{}/Data{:04}", data_dir, i);
+            overwrite_part_master(vol, &part_path, master.bytes())?;
+        }
+        let _ = vol.flush();
+
+        if let Some(cb) = opts.progress.as_deref_mut() {
+            cb("header", 0, 1);
+        }
+
+        let mut con_header = ConHeaderBuilder::new()
+            .with_execution_info(&compact.exe_info)
+            .with_block_counts(block_count as u32, 0)
+            .with_data_parts_info(
+                part_count as u32,
+                last_part_size + (part_count - 1) * BLOCK_SIZE * 0xa290,
+            )
+            .with_content_type(compact.content_type)
+            .with_mht_hash(&master_lists[0].digest());
+        if let Some(title) = opts.game_title {
+            con_header = con_header.with_game_title(title);
+        }
+        let con_bytes = con_header.finalize();
+        let con_len = con_bytes.len() as u64;
+        vol.create_file_from_reader(&con_header_path, con_len, Cursor::new(con_bytes), None)?;
+        let _ = vol.flush();
+
+        if let Some(cb) = opts.progress.as_deref_mut() {
+            cb("header", 1, 1);
+        }
+
+        return Ok(report);
     }
 
     // --- Metadata pass (mirrors convert_iso) --------------------------------
