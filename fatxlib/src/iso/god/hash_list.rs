@@ -4,6 +4,7 @@ use crate::error::{FatxError, Result};
 
 use super::sha1_digest;
 
+#[derive(Clone)]
 pub struct HashList {
     buffer: [u8; 4096],
     len: usize,

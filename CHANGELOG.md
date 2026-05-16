@@ -2,6 +2,16 @@
 
 All notable changes to `xtafkit` will be documented in this file.
 
+## [Unreleased]
+
+### ISO / disc-image support
+- Added `xtafkit extract` for streaming Xbox / Xbox 360 XISO contents to a local directory, with `$SystemUpdate` skipped by default.
+- Added `xtafkit god` for XISO → Games-on-Demand conversion. Default trim is now `compact`; `preserve-layout` and `none` stay available for debugging and compatibility.
+- Introduced a shared `fatxlib::iso` namespace for image reading, manifest planning, compact repacking, and GoD conversion.
+- Reworked compact GoD conversion to stream a virtual dense XDVDFS layout instead of staging a temporary ISO on disk.
+- Centralized ISO filtering and planning so extract, compact trim, and dry-run reporting share the same manifest.
+- Removed the old public `fatxlib::xiso` and `fatxlib::iso2god` entry points in favor of `fatxlib::iso::{image,manifest,compact,god}`.
+
 ## [1.1.0] - 2026-05-16
 
 First release under the `xtafkit` name. Forked from

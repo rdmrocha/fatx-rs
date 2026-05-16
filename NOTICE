@@ -19,7 +19,7 @@ License, Version 2.0. See LICENSE for the full license text.
 
 Third-party code vendored under Apache-2.0-compatible licenses:
 
-iso2god (in fatxlib/src/iso2god/)
+iso2god (in fatxlib/src/iso/god/)
 ---------------------------------
 Vendored from QAston/iso2god-rs (xdvdfx branch), itself a fork of
 iliazeus/iso2god-rs. Both are MIT-licensed:
