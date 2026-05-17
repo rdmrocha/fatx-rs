@@ -35,6 +35,8 @@ cargo build --release
 
 Produces a single binary: `target/release/xtafkit`.
 
+The default build links against the system OpenSSL for hardware-accelerated SHA-1 during GoD conversion. On macOS install via Homebrew (`brew install openssl@3`); on Debian/Ubuntu install `libssl-dev`. To skip the OpenSSL dependency entirely and fall back to portable Rust SHA-1, build with `cargo build --release --no-default-features`.
+
 ## Quick start
 
 ```bash
@@ -90,13 +92,31 @@ sudo xtafkit browse /dev/rdisk4 --partition "360 Data"
 | `R` | Resolve title or bulk-scan files (slot-aware) |
 | `s` | Toggle sort: by name ⇄ by ID (flips bracket order) |
 | `m` | Create directory |
-| `d` / `u` | Download / upload |
+| `d` / `u` | Download / upload (XISO uploads prompt for e**(X)**tract / **(G)**oD / **(R)**aw — see below) |
 | `D` / `r` | Delete / rename |
 | `i` | Volume info |
 | `c` | Clean up macOS metadata |
 | `Esc` / `q` | Cancel running operation / quit |
 
 Entries that can be resolved show a `?` marker. Resolution results are cached under `~/.config/xtafkit/` and persist across runs.
+
+### Uploading an XISO
+
+When the file you point at is an Xbox / Xbox 360 disc image (XDVDFS volume detected automatically), the upload prompt becomes:
+
+```
+Detected XISO 'Halo.iso'. e(X)tract / (G)oD / (R)aw / Esc:
+```
+
+| Choice | Result |
+|---|---|
+| **(X)tract** | Walks the XISO and writes each file into `<cwd>/<name>/` on the drive. `$SystemUpdate` is skipped automatically. `<name>` is the catalog-known game title when available, otherwise the local filename stem. Best for alt dashboards (Aurora / FreeStyle / XBMC4XBOX) that launch loose `default.xex` / `default.xbe` directly. |
+| **(G)oD** | Streams a Games-on-Demand package into `<cwd>/<TitleID>/00007000/<MediaID>{,.data/}`. Uses the compact trim by default so the output is sized to actual content, not the original mastered layout. Required for stock Xbox 360 backward-compatibility playback. |
+| **(R)aw** | Plain byte-for-byte copy of the source ISO file. |
+
+The default action (the capitalized letter) flips by context: inside `/Content/<XUID>/` the default is **G** (where the dashboard looks for BC packages); everywhere else the default is **X**.
+
+Press `Esc` to cancel mid-conversion at any time — the worker checks between parts and between hash-tree steps.
 
 ## `xtafkit resolve`
 

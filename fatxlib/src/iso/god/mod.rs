@@ -19,12 +19,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::error::{FatxError, Result};
 
+pub const SOURCE_BUFFER_SIZE: usize = 1 << 20;
+
 mod convert;
-pub use convert::{
-    ConvertOptions, ConvertReport, SOURCE_BUFFER_SIZE, TrimMode, convert_iso, convert_iso_to_fatx,
-};
+pub use convert::{ConvertOptions, ConvertReport, TrimMode, convert_iso, convert_iso_to_fatx};
 
 mod con_header;
+mod core;
 pub use con_header::*;
 
 mod file_layout;
@@ -35,6 +36,10 @@ pub use gdf_sector::*;
 
 mod hash_list;
 pub use hash_list::*;
+
+mod prepare;
+mod sink_fatx;
+mod sink_host;
 
 /// Single hot-path SHA-1 entry point used by [`HashList`] and
 /// [`ConHeaderBuilder`]. With the `openssl-hash` feature (default on)
