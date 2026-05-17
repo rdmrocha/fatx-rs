@@ -38,6 +38,14 @@ fn main() {
 
     let xbox360 = read_xbox360("data/xbox360_titles.json");
     let xbox_og = read_xbox_originals("data/xbox_originals.tsv");
+    assert!(
+        xbox360.len() > 4000,
+        "xbox360 title catalog unexpectedly small"
+    );
+    assert!(
+        xbox_og.len() > 800,
+        "xbox original title catalog unexpectedly small"
+    );
     let (merged, conflicts) = merge(&xbox360, &xbox_og);
 
     write_merged(&out_dir.join("titles.rs"), &merged);
@@ -197,11 +205,14 @@ fn strip_ws(s: &str) -> String {
 
 fn write_merged(dst: &PathBuf, map: &BTreeMap<u32, (String, &str)>) {
     let mut builder = phf_codegen::Map::<u32>::new();
-    let literals: Vec<String> = map
-        .values()
-        .map(|(name, src)| format!("TitleInfo {{ name: {name:?}, source: {src} }}"))
-        .collect();
-    for ((id, _), lit) in map.iter().zip(literals.iter()) {
+    let mut entries = Vec::with_capacity(map.len());
+    for (id, (name, src)) in map {
+        entries.push((
+            *id,
+            format!("TitleInfo {{ name: {name:?}, source: {src} }}"),
+        ));
+    }
+    for (id, lit) in &entries {
         builder.entry(*id, lit);
     }
 

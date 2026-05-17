@@ -193,7 +193,9 @@ fn format_image(file: &mut File, size: u64, is_xtaf: bool, spc: u32) -> Result<(
     let total_clusters = if is_xtaf {
         ((size - SUPERBLOCK_SIZE) / cluster_size) as u32
     } else {
-        let entry_size_est = if total_sectors.saturating_sub(260) / spc as u64 >= 65_525 {
+        let entry_size_est = if total_sectors.saturating_sub(260) / spc as u64
+            >= fatxlib::types::FAT16_CLUSTER_THRESHOLD as u64
+        {
             4u64
         } else {
             2u64
@@ -201,7 +203,9 @@ fn format_image(file: &mut File, size: u64, is_xtaf: bool, spc: u32) -> Result<(
         (total_sectors * SECTOR_SIZE / (cluster_size + entry_size_est)) as u32
     };
 
-    let fat_type = if total_sectors.saturating_sub(260) / spc as u64 >= 65_525 {
+    let fat_type = if total_sectors.saturating_sub(260) / spc as u64
+        >= fatxlib::types::FAT16_CLUSTER_THRESHOLD as u64
+    {
         FatType::Fat32
     } else {
         FatType::Fat16

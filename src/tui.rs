@@ -47,7 +47,7 @@ use std::io::{self, stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
 use crossterm::{
@@ -244,7 +244,7 @@ enum IoResp {
 // App state
 // ===========================================================================
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 enum InputMode {
     Normal,
@@ -281,6 +281,8 @@ struct App {
     cancel_flag: Arc<AtomicBool>,
     /// Pending cleanup paths awaiting user confirmation.
     pending_cleanup: Vec<(String, bool, u64)>,
+    /// Pending single-delete target captured when the prompt is opened.
+    pending_delete: Option<(String, bool)>,
     /// Local XISO path + default action stashed between the upload prompt
     /// and the three-way confirmation prompt (extract / GoD / raw).
     pending_xiso_upload: Option<(PathBuf, XisoUploadAction)>,
@@ -390,6 +392,7 @@ impl App {
             is_busy: false,
             cancel_flag,
             pending_cleanup: Vec::new(),
+            pending_delete: None,
             pending_xiso_upload: None,
             sort_mode: SortMode::ByName,
         }
@@ -562,15 +565,16 @@ fn io_worker(
                     let size = data.len() as u64;
                     match vol.create_or_replace_file(&fatx_path, &data) {
                         Ok(_) => {
-                            let _ = vol.flush();
-                            let _ = resp_tx.send(IoResp::Done {
-                                message: format!(
-                                    "Uploaded '{}' → {} ({})",
-                                    local_path.display(),
-                                    fatx_path,
-                                    format_size(size)
-                                ),
-                            });
+                            if !flush_or_error(&mut vol, &resp_tx, "Upload flush failed") {
+                                let _ = resp_tx.send(IoResp::Done {
+                                    message: format!(
+                                        "Uploaded '{}' → {} ({})",
+                                        local_path.display(),
+                                        fatx_path,
+                                        format_size(size)
+                                    ),
+                                });
+                            }
                         }
                         Err(e) => {
                             let _ = resp_tx.send(IoResp::Error {
@@ -606,6 +610,7 @@ fn io_worker(
                 let mut bytes_done = 0u64;
                 let mut files_done = 0usize;
                 let mut cancelled = false;
+                let mut failed = false;
                 let mut files_since_flush = 0usize;
                 let mut bytes_since_flush = 0u64;
 
@@ -661,11 +666,8 @@ fn io_worker(
                     }
 
                     if files_since_flush >= 100 || bytes_since_flush >= 256 * 1024 * 1024 {
-                        if let Err(e) = vol.flush() {
-                            let _ = resp_tx.send(IoResp::Error {
-                                message: format!("Periodic flush failed: {}", e),
-                            });
-                            cancelled = true;
+                        if flush_or_error(&mut vol, &resp_tx, "Periodic flush failed") {
+                            failed = true;
                             break;
                         }
                         files_since_flush = 0;
@@ -673,7 +675,9 @@ fn io_worker(
                     }
                 }
 
-                let _ = vol.flush();
+                if flush_or_error(&mut vol, &resp_tx, "Final flush failed") {
+                    failed = true;
+                }
 
                 if cancelled {
                     let _ = resp_tx.send(IoResp::Cancelled {
@@ -684,6 +688,8 @@ fn io_worker(
                             format_size(bytes_done)
                         ),
                     });
+                } else if failed {
+                    // Error already reported by flush_or_error.
                 } else {
                     let _ = resp_tx.send(IoResp::Done {
                         message: format!(
@@ -818,10 +824,7 @@ fn io_worker(
 
                     // Flush periodically so a long extract survives a yank.
                     if files_since_flush >= 100 || bytes_since_flush >= 256 * 1024 * 1024 {
-                        if let Err(e) = vol.flush() {
-                            let _ = resp_tx.send(IoResp::Error {
-                                message: format!("Periodic flush failed: {}", e),
-                            });
+                        if flush_or_error(&mut vol, &resp_tx, "Periodic flush failed") {
                             failed = true;
                             break;
                         }
@@ -830,7 +833,9 @@ fn io_worker(
                     }
                 }
 
-                let _ = vol.flush();
+                if flush_or_error(&mut vol, &resp_tx, "Final flush failed") {
+                    failed = true;
+                }
 
                 if cancelled {
                     let _ = resp_tx.send(IoResp::Cancelled {
@@ -987,7 +992,9 @@ fn io_worker(
                     &source, &mut vol, &dest_dir, &mut opts,
                 ) {
                     Ok(r) => {
-                        let _ = vol.flush();
+                        if flush_or_error(&mut vol, &resp_tx, "GoD flush failed") {
+                            continue;
+                        }
                         // Rough total: per-part overhead (4 KiB master +
                         // 4 KiB × subparts) plus the CON header. Reporting
                         // the source-side data size is close enough.
@@ -1004,7 +1011,7 @@ fn io_worker(
                         });
                     }
                     Err(e) => {
-                        let _ = vol.flush();
+                        let _ = flush_or_error(&mut vol, &resp_tx, "GoD flush failed");
                         let msg = format!("{}", e);
                         if msg.contains("cancelled") {
                             let _ = resp_tx.send(IoResp::Cancelled {
@@ -1021,10 +1028,11 @@ fn io_worker(
 
             IoCmd::Mkdir { path } => match vol.create_directory(&path) {
                 Ok(_) => {
-                    let _ = vol.flush();
-                    let _ = resp_tx.send(IoResp::Done {
-                        message: format!("Created directory '{}'", path),
-                    });
+                    if !flush_or_error(&mut vol, &resp_tx, "Mkdir flush failed") {
+                        let _ = resp_tx.send(IoResp::Done {
+                            message: format!("Created directory '{}'", path),
+                        });
+                    }
                 }
                 Err(e) => {
                     let _ = resp_tx.send(IoResp::Error {
@@ -1041,10 +1049,11 @@ fn io_worker(
                 };
                 match result {
                     Ok(_) => {
-                        let _ = vol.flush();
-                        let _ = resp_tx.send(IoResp::Done {
-                            message: format!("Deleted '{}'", path),
-                        });
+                        if !flush_or_error(&mut vol, &resp_tx, "Delete flush failed") {
+                            let _ = resp_tx.send(IoResp::Done {
+                                message: format!("Deleted '{}'", path),
+                            });
+                        }
                     }
                     Err(e) => {
                         let _ = resp_tx.send(IoResp::Error {
@@ -1056,10 +1065,11 @@ fn io_worker(
 
             IoCmd::Rename { path, new_name } => match vol.rename(&path, &new_name) {
                 Ok(_) => {
-                    let _ = vol.flush();
-                    let _ = resp_tx.send(IoResp::Done {
-                        message: format!("Renamed → '{}'", new_name),
-                    });
+                    if !flush_or_error(&mut vol, &resp_tx, "Rename flush failed") {
+                        let _ = resp_tx.send(IoResp::Done {
+                            message: format!("Renamed → '{}'", new_name),
+                        });
+                    }
                 }
                 Err(e) => {
                     let _ = resp_tx.send(IoResp::Error {
@@ -1121,15 +1131,16 @@ fn io_worker(
                         }
                     }
                 }
-                let _ = vol.flush();
-                let _ = resp_tx.send(IoResp::Done {
-                    message: format!(
-                        "Removed {} file(s), {} dir(s), freed {}",
-                        files,
-                        dirs,
-                        format_size(bytes)
-                    ),
-                });
+                if !flush_or_error(&mut vol, &resp_tx, "Cleanup flush failed") {
+                    let _ = resp_tx.send(IoResp::Done {
+                        message: format!(
+                            "Removed {} file(s), {} dir(s), freed {}",
+                            files,
+                            dirs,
+                            format_size(bytes)
+                        ),
+                    });
+                }
             }
 
             IoCmd::ResolveTitle { path } => {
@@ -1168,7 +1179,9 @@ fn io_worker(
             }
 
             IoCmd::Flush => {
-                let _ = vol.flush();
+                if flush_or_error(&mut vol, &resp_tx, "Flush failed") {
+                    continue;
+                }
                 let _ = resp_tx.send(IoResp::Flushed);
             }
 
@@ -1261,6 +1274,42 @@ fn create_dirs_recursive(vol: &mut FatxVolume<std::fs::File>, local_dir: &PathBu
     }
 }
 
+fn flush_or_error(
+    vol: &mut FatxVolume<std::fs::File>,
+    resp_tx: &mpsc::Sender<IoResp>,
+    context: &str,
+) -> bool {
+    match vol.flush() {
+        Ok(()) => false,
+        Err(e) => {
+            let _ = resp_tx.send(IoResp::Error {
+                message: format!("{}: {}", context, e),
+            });
+            true
+        }
+    }
+}
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = stdout().execute(LeaveAlternateScreen);
+        let _ = stdout().execute(Show);
+    }
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_raw_mode();
+        let _ = stdout().execute(LeaveAlternateScreen);
+        let _ = stdout().execute(Show);
+        default_hook(panic_info);
+    }));
+}
+
 // ===========================================================================
 // Main entry point
 // ===========================================================================
@@ -1283,9 +1332,11 @@ pub fn run_browser(
     });
 
     // Setup terminal
+    install_panic_hook();
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let _terminal_guard = TerminalGuard;
 
     let mut app = App::new(partition_name, device_display, Arc::clone(&cancel_flag));
 
@@ -1311,8 +1362,17 @@ pub fn run_browser(
         }
 
         // Process all pending I/O responses (non-blocking)
-        while let Ok(resp) = resp_rx.try_recv() {
-            handle_io_response(&mut app, &cmd_tx, resp);
+        loop {
+            match resp_rx.try_recv() {
+                Ok(resp) => handle_io_response(&mut app, &cmd_tx, resp),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    app.is_busy = false;
+                    app.should_quit = true;
+                    app.set_error("I/O worker stopped unexpectedly");
+                    break;
+                }
+            }
         }
 
         // Poll for key events (50ms timeout — ~20fps refresh)
@@ -1337,11 +1397,6 @@ pub fn run_browser(
     // Shutdown I/O worker
     let _ = cmd_tx.send(IoCmd::Shutdown);
     let _ = worker_handle.join();
-
-    // Restore terminal
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
-
     Ok(())
 }
 
@@ -1614,6 +1669,7 @@ fn handle_normal_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent)
                 };
                 app.input_prompt = msg;
                 app.input_buffer.clear();
+                app.pending_delete = Some((name, is_dir));
                 app.input_mode = InputMode::ConfirmDelete;
             }
         }
@@ -1647,225 +1703,244 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
             // If the user was answering the XISO extract/raw prompt, drop the
             // stashed path so the next upload starts clean.
             app.pending_xiso_upload = None;
+            app.pending_delete = None;
             app.set_status("Cancelled.");
         }
         KeyCode::Enter => {
             let input = app.input_buffer.clone();
+            let mode = app.input_mode;
             app.input_mode = InputMode::Normal;
 
-            // Dispatch based on what mode we were in (using the prompt to determine)
-            if app.input_prompt.starts_with("Save '") {
-                // Download
-                let name = app.selected_name().unwrap_or_default();
-                let fatx_path = app.full_path(&name);
-                let local_path = PathBuf::from(unescape_path(&input));
-                app.download_dir = local_path
-                    .parent()
-                    .unwrap_or(&PathBuf::from("."))
-                    .to_path_buf();
-                app.set_status(&format!("Downloading '{}'...", name));
-                let _ = cmd_tx.send(IoCmd::ReadFile {
-                    fatx_path,
-                    local_path,
-                });
-                app.is_busy = true;
-            } else if app.input_prompt.starts_with("Upload ") {
-                // Upload file or directory — unescape shell backslashes
-                // (e.g. Call\ of\ Duty) and trim leading/trailing whitespace
-                // (drag-and-drop into the terminal often appends a space).
-                let path = PathBuf::from(unescape_path(input.trim()));
-                if !path.exists() {
-                    app.set_error(&format!("Not found: {}", input));
-                    return;
-                }
-                let filename = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "file.dat".to_string());
-
-                if path.is_dir() {
-                    let fatx_dest = app.full_path(&filename);
-                    app.set_status(&format!("Uploading directory '{}'...", filename));
-                    let _ = cmd_tx.send(IoCmd::CopyDir {
-                        local_path: path.clone(),
-                        fatx_dest,
-                    });
-                    app.download_dir = path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
-                    app.is_busy = true;
-                } else if is_xiso(&path) {
-                    // Detected an Xbox disc image. Pick the default action
-                    // based on cwd: inside a per-user Content folder (where
-                    // GoD packages live), default to GoD; everywhere else
-                    // default to extract (works for alt dashboards).
-                    let default = if fatxlib::display::folder_slot(&app.cwd)
-                        == fatxlib::display::FolderSlot::TitleId
-                    {
-                        XisoUploadAction::God
-                    } else {
-                        XisoUploadAction::Extract
-                    };
-                    let prompt = match default {
-                        XisoUploadAction::Extract => format!(
-                            "Detected XISO '{}'. e(X)tract / (g)oD / (r)aw / Esc:",
-                            filename
-                        ),
-                        XisoUploadAction::God => format!(
-                            "Detected XISO '{}'. e(x)tract / (G)oD / (r)aw / Esc:",
-                            filename
-                        ),
-                        XisoUploadAction::Raw => format!(
-                            "Detected XISO '{}'. e(x)tract / (g)oD / (R)aw / Esc:",
-                            filename
-                        ),
-                    };
-                    app.pending_xiso_upload = Some((path.clone(), default));
-                    app.download_dir = path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
-                    app.input_mode = InputMode::ConfirmXisoUpload;
-                    app.input_prompt = prompt;
-                    app.input_buffer.clear();
-                } else {
-                    let fatx_path = app.full_path(&filename);
-                    app.set_status(&format!("Uploading '{}'...", filename));
-                    let _ = cmd_tx.send(IoCmd::WriteFile {
-                        local_path: path.clone(),
+            match mode {
+                InputMode::DownloadPath => {
+                    // Download
+                    let name = app.selected_name().unwrap_or_default();
+                    let fatx_path = app.full_path(&name);
+                    let local_path = PathBuf::from(unescape_path(&input));
+                    app.download_dir = local_path
+                        .parent()
+                        .unwrap_or(&PathBuf::from("."))
+                        .to_path_buf();
+                    app.set_status(&format!("Downloading '{}'...", name));
+                    let _ = cmd_tx.send(IoCmd::ReadFile {
                         fatx_path,
+                        local_path,
                     });
-                    app.download_dir = path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
                     app.is_busy = true;
                 }
-            } else if app.input_prompt.starts_with("Detected XISO") {
-                let (path, default) = match app.pending_xiso_upload.take() {
-                    Some(pair) => pair,
-                    None => {
-                        app.set_error("Internal: missing pending XISO path.");
+                InputMode::UploadPath => {
+                    // Upload file or directory — unescape shell backslashes
+                    // (e.g. Call\ of\ Duty) and trim leading/trailing whitespace
+                    // (drag-and-drop into the terminal often appends a space).
+                    let path = PathBuf::from(unescape_path(input.trim()));
+                    if !path.exists() {
+                        app.set_error(&format!("Not found: {}", input));
                         return;
                     }
-                };
-                let trimmed = input.trim();
-                let action = if trimmed.is_empty() {
-                    default
-                } else {
-                    match trimmed.chars().next().map(|c| c.to_ascii_lowercase()) {
-                        Some('x') => XisoUploadAction::Extract,
-                        Some('g') => XisoUploadAction::God,
-                        Some('r') => XisoUploadAction::Raw,
-                        _ => {
-                            app.set_error(&format!(
-                                "Unknown choice {:?} — expected x, g, or r.",
-                                trimmed
-                            ));
-                            return;
-                        }
-                    }
-                };
-                let filename = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "iso".to_string());
+                    let filename = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "file.dat".to_string());
 
-                match action {
-                    XisoUploadAction::Extract => {
-                        // Prefer a catalog-resolved folder name over the
-                        // local filename stem: a disc named `disc1.iso`
-                        // with TitleID 0x4D5307E6 should land at
-                        // `<cwd>/Halo 3 [4D5307E6]/` rather than `<cwd>/disc1/`.
-                        // Falls back to the file stem on catalog miss or
-                        // unreadable XEX/XBE.
-                        let stem = path
-                            .file_stem()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| filename.clone());
-                        let resolved = xiso_folder_name(&path).unwrap_or(stem);
-                        let dest_dir = app.full_path(&resolved);
-                        app.set_status(&format!("Extracting '{}' → {}...", filename, dest_dir));
-                        let _ = cmd_tx.send(IoCmd::ExtractXiso {
-                            source: path,
-                            dest_dir,
+                    if path.is_dir() {
+                        let fatx_dest = app.full_path(&filename);
+                        app.set_status(&format!("Uploading directory '{}'...", filename));
+                        let _ = cmd_tx.send(IoCmd::CopyDir {
+                            local_path: path.clone(),
+                            fatx_dest,
                         });
+                        app.download_dir =
+                            path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
                         app.is_busy = true;
-                    }
-                    XisoUploadAction::God => {
-                        let dest_dir = app.cwd.clone();
-                        app.set_status(&format!(
-                            "Converting '{}' to GoD under {}...",
-                            filename, dest_dir
-                        ));
-                        let _ = cmd_tx.send(IoCmd::ConvertXisoToGod {
-                            source: path,
-                            dest_dir,
-                        });
-                        app.is_busy = true;
-                    }
-                    XisoUploadAction::Raw => {
+                    } else if is_xiso(&path) {
+                        // Detected an Xbox disc image. Pick the default action
+                        // based on cwd: inside a per-user Content folder (where
+                        // GoD packages live), default to GoD; everywhere else
+                        // default to extract (works for alt dashboards).
+                        let default = if fatxlib::display::folder_slot(&app.cwd)
+                            == fatxlib::display::FolderSlot::TitleId
+                        {
+                            XisoUploadAction::God
+                        } else {
+                            XisoUploadAction::Extract
+                        };
+                        let prompt = match default {
+                            XisoUploadAction::Extract => format!(
+                                "Detected XISO '{}'. e(X)tract / (g)oD / (r)aw / Esc:",
+                                filename
+                            ),
+                            XisoUploadAction::God => format!(
+                                "Detected XISO '{}'. e(x)tract / (G)oD / (r)aw / Esc:",
+                                filename
+                            ),
+                            XisoUploadAction::Raw => format!(
+                                "Detected XISO '{}'. e(x)tract / (g)oD / (R)aw / Esc:",
+                                filename
+                            ),
+                        };
+                        app.pending_xiso_upload = Some((path.clone(), default));
+                        app.download_dir =
+                            path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
+                        app.input_mode = InputMode::ConfirmXisoUpload;
+                        app.input_prompt = prompt;
+                        app.input_buffer.clear();
+                    } else {
                         let fatx_path = app.full_path(&filename);
-                        app.set_status(&format!("Uploading '{}' (raw)...", filename));
+                        app.set_status(&format!("Uploading '{}'...", filename));
                         let _ = cmd_tx.send(IoCmd::WriteFile {
-                            local_path: path,
+                            local_path: path.clone(),
                             fatx_path,
                         });
+                        app.download_dir =
+                            path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
                         app.is_busy = true;
                     }
                 }
-            } else if app.input_prompt.starts_with("New directory") {
-                // Mkdir
-                if !input.is_empty() {
-                    let path = app.full_path(&input);
-                    app.set_status(&format!("Creating '{}'...", input));
-                    let _ = cmd_tx.send(IoCmd::Mkdir { path });
-                    app.is_busy = true;
+                InputMode::ConfirmXisoUpload => {
+                    let (path, default) = match app.pending_xiso_upload.take() {
+                        Some(pair) => pair,
+                        None => {
+                            app.set_error("Internal: missing pending XISO path.");
+                            return;
+                        }
+                    };
+                    let trimmed = input.trim();
+                    let action = if trimmed.is_empty() {
+                        default
+                    } else {
+                        match trimmed.chars().next().map(|c| c.to_ascii_lowercase()) {
+                            Some('x') => XisoUploadAction::Extract,
+                            Some('g') => XisoUploadAction::God,
+                            Some('r') => XisoUploadAction::Raw,
+                            _ => {
+                                app.set_error(&format!(
+                                    "Unknown choice {:?} — expected x, g, or r.",
+                                    trimmed
+                                ));
+                                return;
+                            }
+                        }
+                    };
+                    let filename = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "iso".to_string());
+
+                    match action {
+                        XisoUploadAction::Extract => {
+                            // Prefer a catalog-resolved folder name over the
+                            // local filename stem: a disc named `disc1.iso`
+                            // with TitleID 0x4D5307E6 should land at
+                            // `<cwd>/Halo 3 [4D5307E6]/` rather than `<cwd>/disc1/`.
+                            // Falls back to the file stem on catalog miss or
+                            // unreadable XEX/XBE.
+                            let stem = path
+                                .file_stem()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| filename.clone());
+                            let resolved = xiso_folder_name(&path).unwrap_or(stem);
+                            let dest_dir = app.full_path(&resolved);
+                            app.set_status(&format!("Extracting '{}' → {}...", filename, dest_dir));
+                            let _ = cmd_tx.send(IoCmd::ExtractXiso {
+                                source: path,
+                                dest_dir,
+                            });
+                            app.is_busy = true;
+                        }
+                        XisoUploadAction::God => {
+                            let dest_dir = app.cwd.clone();
+                            app.set_status(&format!(
+                                "Converting '{}' to GoD under {}...",
+                                filename, dest_dir
+                            ));
+                            let _ = cmd_tx.send(IoCmd::ConvertXisoToGod {
+                                source: path,
+                                dest_dir,
+                            });
+                            app.is_busy = true;
+                        }
+                        XisoUploadAction::Raw => {
+                            let fatx_path = app.full_path(&filename);
+                            app.set_status(&format!("Uploading '{}' (raw)...", filename));
+                            let _ = cmd_tx.send(IoCmd::WriteFile {
+                                local_path: path,
+                                fatx_path,
+                            });
+                            app.is_busy = true;
+                        }
+                    }
                 }
-            } else if app.input_prompt.starts_with("Rename '") {
-                // Rename
-                let old_name = app.selected_name().unwrap_or_default();
-                if !input.is_empty() {
-                    let path = app.full_path(&old_name);
-                    let _ = cmd_tx.send(IoCmd::Rename {
-                        path,
-                        new_name: input.clone(),
-                    });
-                    app.is_busy = true;
+                InputMode::MkdirName => {
+                    // Mkdir
+                    if !input.is_empty() {
+                        let path = app.full_path(&input);
+                        app.set_status(&format!("Creating '{}'...", input));
+                        let _ = cmd_tx.send(IoCmd::Mkdir { path });
+                        app.is_busy = true;
+                    }
                 }
-            } else if app.input_prompt.starts_with("Delete '") {
-                // Confirm delete
-                if input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes") {
-                    let name = app.selected_name().unwrap_or_default();
-                    let is_dir = app.selected_entry().map(|e| e.is_dir).unwrap_or(false);
-                    let path = app.full_path(&name);
-                    app.set_status(&format!("Deleting '{}'...", name));
-                    let _ = cmd_tx.send(IoCmd::Delete {
-                        path,
-                        recursive: is_dir,
-                    });
-                    app.is_busy = true;
-                } else {
-                    app.set_status("Delete cancelled.");
+                InputMode::RenameName => {
+                    // Rename
+                    let old_name = app.selected_name().unwrap_or_default();
+                    if !input.is_empty() {
+                        let path = app.full_path(&old_name);
+                        let _ = cmd_tx.send(IoCmd::Rename {
+                            path,
+                            new_name: input.clone(),
+                        });
+                        app.is_busy = true;
+                    }
                 }
-            } else if app.input_prompt.contains("Delete? (y/n):") {
-                // Confirm cleanup
-                if input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes") {
-                    let paths: Vec<String> = app
-                        .pending_cleanup
-                        .drain(..)
-                        .map(|(path, _, _)| path)
-                        .collect();
-                    let count = paths.len();
-                    app.set_status(&format!("Deleting {} metadata entries...", count));
-                    let _ = cmd_tx.send(IoCmd::DeleteCleanup { paths });
-                    app.is_busy = true;
-                } else {
-                    app.pending_cleanup.clear();
-                    app.set_status("Cleanup cancelled.");
+                InputMode::ConfirmDelete => {
+                    // Confirm delete
+                    if input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes") {
+                        let (name, is_dir) = match app.pending_delete.take() {
+                            Some(pair) => pair,
+                            None => {
+                                app.set_error("Internal: missing pending delete target.");
+                                return;
+                            }
+                        };
+                        let path = app.full_path(&name);
+                        app.set_status(&format!("Deleting '{}'...", name));
+                        let _ = cmd_tx.send(IoCmd::Delete {
+                            path,
+                            recursive: is_dir,
+                        });
+                        app.is_busy = true;
+                    } else {
+                        app.pending_delete = None;
+                        app.set_status("Delete cancelled.");
+                    }
                 }
+                InputMode::ConfirmCleanup => {
+                    // Confirm cleanup
+                    if input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes") {
+                        let paths: Vec<String> = app
+                            .pending_cleanup
+                            .drain(..)
+                            .map(|(path, _, _)| path)
+                            .collect();
+                        let count = paths.len();
+                        app.set_status(&format!("Deleting {} metadata entries...", count));
+                        let _ = cmd_tx.send(IoCmd::DeleteCleanup { paths });
+                        app.is_busy = true;
+                    } else {
+                        app.pending_cleanup.clear();
+                        app.set_status("Cleanup cancelled.");
+                    }
+                }
+                InputMode::Normal => {}
             }
         }
         KeyCode::Backspace => {
             app.input_buffer.pop();
         }
         KeyCode::Char(c) => {
-            if app.input_mode == InputMode::ConfirmDelete
-                || app.input_mode == InputMode::ConfirmCleanup
-                || app.input_mode == InputMode::ConfirmXisoUpload
-            {
+            if matches!(
+                app.input_mode,
+                InputMode::ConfirmDelete | InputMode::ConfirmCleanup | InputMode::ConfirmXisoUpload
+            ) {
                 app.input_buffer = c.to_string();
             } else {
                 app.input_buffer.push(c);

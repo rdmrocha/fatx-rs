@@ -236,7 +236,7 @@ fn guided_partition_selection() -> Option<SelectedPartition> {
     // Check for sudo
     if !running_as_root() {
         println!("[!] You're not running as root. Raw device access requires sudo.");
-        println!("    Re-run with: sudo fatx");
+        println!("    Re-run with: sudo xtafkit");
         println!();
         print!("Continue anyway? (y/n): ");
         io::stdout().flush().unwrap();
@@ -876,7 +876,7 @@ fn main() {
             }
             if deep && !json {
                 println!("\nDeep scanning up to 0x{:X}...", deep_limit);
-                match fatxlib::partition::scan_for_fatx(&mut file, deep_limit) {
+                match fatxlib::partition::scan_for_fatx(&mut file, dev_size, deep_limit) {
                     Ok(offsets) => {
                         if offsets.is_empty() {
                             println!("No additional signatures found.");

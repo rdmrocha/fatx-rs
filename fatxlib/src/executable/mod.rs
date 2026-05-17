@@ -43,7 +43,7 @@ impl TitleExecutionInfo {
         reader.seek(SeekFrom::Current(8)).map_err(FatxError::Io)?;
         let title_id = reader.read_u32::<LE>().map_err(FatxError::Io)?;
 
-        reader.seek(SeekFrom::Current(164)).map_err(FatxError::Io)?;
+        reader.seek(SeekFrom::Current(160)).map_err(FatxError::Io)?;
         let version = reader.read_u32::<LE>().map_err(FatxError::Io)?;
 
         Ok(TitleExecutionInfo {
@@ -104,5 +104,30 @@ impl TitleInfo {
                 "no executable found in this image".to_string(),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::xbe::XbeHeader;
+
+    #[test]
+    fn xbe_certificate_version_is_read_from_correct_offset() {
+        let mut data = vec![0u8; 0x200];
+        data[0..4].copy_from_slice(b"XBEH");
+        data[0x104..0x108].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        data[0x118..0x11c].copy_from_slice(&0x0001_0100u32.to_le_bytes());
+
+        let title_id = 0x4D53_07E6u32;
+        let version = 0x1122_3344u32;
+        let wrong_version = 0x5566_7788u32;
+        data[0x108..0x10c].copy_from_slice(&title_id.to_le_bytes());
+        data[0x1ac..0x1b0].copy_from_slice(&version.to_le_bytes());
+        data[0x1b0..0x1b4].copy_from_slice(&wrong_version.to_le_bytes());
+
+        let header = XbeHeader::read(std::io::Cursor::new(data)).expect("parse synthetic xbe");
+        let info = header.fields.execution_info.expect("execution info");
+        assert_eq!(info.title_id, title_id);
+        assert_eq!(info.version, version);
     }
 }

@@ -137,6 +137,23 @@ pub(crate) fn prepare_source(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn test_prepared_source(
+    report: ConvertReport,
+    exe_info: crate::executable::TitleExecutionInfo,
+    content_type: ContentType,
+) -> PreparedSource {
+    PreparedSource {
+        report,
+        exe_info,
+        content_type,
+        reader: ReaderSource::Raw {
+            source_iso: PathBuf::new(),
+            root_offset: 0,
+        },
+    }
+}
+
 fn build_report(
     title_id: u32,
     media_id: u32,

@@ -4,7 +4,7 @@
 //! and provides methods to navigate directories, read files, and perform write operations.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 
 use log::{info, warn};
 
@@ -61,6 +61,7 @@ pub struct FatxVolume<T: Read + Write + Seek> {
 
 /// Progress callback: `(fatx_path, file_size, total_bytes_so_far)`.
 type ProgressFn<'a> = &'a dyn Fn(&str, u64, u64);
+type CopyStats = (usize, usize, u64);
 
 struct CopyFromHostState<'a> {
     progress: Option<ProgressFn<'a>>,
@@ -104,11 +105,17 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
     ///
     /// - `inner`: A seekable read/write handle to the device or image file.
     /// - `partition_offset`: Byte offset where the FATX partition begins.
-    /// - `partition_size`: Size of the partition in bytes (0 = auto-detect from stream length).
+    /// - `partition_size`: Size of the partition in bytes.
+    ///   Pass the explicit size for raw block devices on macOS.
     pub fn open(mut inner: T, partition_offset: u64, partition_size: u64) -> Result<Self> {
         // Determine actual partition size if not provided.
         let partition_size = if partition_size == 0 {
             let end = inner.seek(SeekFrom::End(0))?;
+            if end == 0 {
+                return Err(FatxError::Other(
+                    "partition size must be supplied for raw devices on macOS".to_string(),
+                ));
+            }
             end.saturating_sub(partition_offset)
         } else {
             partition_size
@@ -188,15 +195,11 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         let total_sectors = (partition_size / SECTOR_SIZE) - (SUPERBLOCK_SIZE / SECTOR_SIZE);
         let spc = sectors_per_cluster as u64;
 
-        // Determine FAT type using the original driver's formula:
-        //   if (total_sectors - 260) / sectors_per_cluster >= 65525 => FAT32
+        // Determine FAT type using the FATX driver's formula:
+        //   if (total_sectors - 260) / sectors_per_cluster >= 65520 => FAT32
         // The "260" accounts for the root directory overhead estimate.
         let cluster_estimate = total_sectors.saturating_sub(260) / spc;
-        let fat_type = if cluster_estimate >= 65_525 {
-            FatType::Fat32
-        } else {
-            FatType::Fat16
-        };
+        let fat_type = fat_type_for_cluster_estimate(cluster_estimate);
 
         let entry_size = fat_type.entry_size();
 
@@ -769,50 +772,13 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             return Err(FatxError::DiskFull);
         }
 
-        let end = FIRST_CLUSTER + self.total_clusters;
-        let start_from = if self.prev_free + 1 >= end {
-            FIRST_CLUSTER
-        } else {
-            self.prev_free + 1
-        };
-
-        let mut allocated = Vec::with_capacity(count);
-        let mut cursor = start_from;
-
-        // Pass 1: from prev_free+1 to end
-        while allocated.len() < count {
-            match self.bitmap_find_free(cursor, end) {
-                Some(cluster) => {
-                    allocated.push(cluster);
-                    cursor = cluster + 1;
-                }
-                None => break,
-            }
-        }
-
-        // Pass 2: wraparound from beginning
-        if allocated.len() < count && start_from > FIRST_CLUSTER {
-            cursor = FIRST_CLUSTER;
-            while allocated.len() < count {
-                match self.bitmap_find_free(cursor, start_from) {
-                    Some(cluster) => {
-                        allocated.push(cluster);
-                        cursor = cluster + 1;
-                    }
-                    None => break,
-                }
-            }
-        }
+        let allocated = self.reserve_free_clusters(count)?;
 
         if allocated.len() < count {
             return Err(FatxError::DiskFull);
         }
 
-        // Chain them together
-        for i in 0..allocated.len() - 1 {
-            self.write_fat_entry(allocated[i], FatEntry::Next(allocated[i + 1]))?;
-        }
-        self.write_fat_entry(*allocated.last().unwrap(), FatEntry::EndOfChain)?;
+        self.link_allocated_clusters(&allocated)?;
 
         // Update prev_free to the last allocated cluster
         self.prev_free = *allocated.last().unwrap();
@@ -1077,8 +1043,9 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
 
     /// Validate a filename for FATX.
     fn validate_filename(name: &str) -> Result<()> {
-        if name.len() > MAX_FILENAME_LEN {
-            return Err(FatxError::FilenameTooLong(name.len(), MAX_FILENAME_LEN));
+        let char_len = name.chars().count();
+        if char_len > MAX_FILENAME_LEN {
+            return Err(FatxError::FilenameTooLong(char_len, MAX_FILENAME_LEN));
         }
         if name.is_empty() {
             return Err(FatxError::FilenameTooLong(0, MAX_FILENAME_LEN));
@@ -1538,56 +1505,18 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         // ── Phase 1: Extend chain if file grew ──
         if clusters_needed > old_count {
             let extra = clusters_needed - old_count;
-            // Find the last cluster in the existing chain
             let last_old = *old_chain.last().unwrap();
-
-            // Allocate additional clusters using bitmap scan from prev_free
-            let mut new_clusters = Vec::with_capacity(extra);
-            let end = FIRST_CLUSTER + self.total_clusters;
-            let start_from = if self.prev_free + 1 >= end {
-                FIRST_CLUSTER
-            } else {
-                self.prev_free + 1
-            };
-            let mut cursor = start_from;
-
-            // Pass 1: from prev_free+1 to end
-            while new_clusters.len() < extra {
-                match self.bitmap_find_free(cursor, end) {
-                    Some(cluster) => {
-                        new_clusters.push(cluster);
-                        cursor = cluster + 1;
-                    }
-                    None => break,
-                }
-            }
-            // Pass 2: wraparound
-            if new_clusters.len() < extra && start_from > FIRST_CLUSTER {
-                cursor = FIRST_CLUSTER;
-                while new_clusters.len() < extra {
-                    match self.bitmap_find_free(cursor, start_from) {
-                        Some(cluster) => {
-                            new_clusters.push(cluster);
-                            cursor = cluster + 1;
-                        }
-                        None => break,
-                    }
-                }
-            }
+            let new_clusters = self.reserve_free_clusters(extra)?;
             if new_clusters.len() < extra {
                 return Err(FatxError::DiskFull);
             }
-            // Update prev_free
             if let Some(&last) = new_clusters.last() {
                 self.prev_free = last;
             }
 
-            // Link: old_last -> new_clusters[0] -> ... -> EOC
             self.write_fat_entry(last_old, FatEntry::Next(new_clusters[0]))?;
-            for i in 0..new_clusters.len() - 1 {
-                self.write_fat_entry(new_clusters[i], FatEntry::Next(new_clusters[i + 1]))?;
-            }
-            self.write_fat_entry(*new_clusters.last().unwrap(), FatEntry::EndOfChain)?;
+            self.link_allocated_clusters(&new_clusters)?;
+            self.flush()?;
 
             // Re-read chain after the extension is linked into the FAT cache.
             chain = self.read_chain(target.first_cluster)?;
@@ -1655,37 +1584,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         if clusters_needed > old_count {
             let extra = clusters_needed - old_count;
             let last_old = *old_chain.last().unwrap();
-
-            let end = FIRST_CLUSTER + self.total_clusters;
-            let start_from = if self.prev_free + 1 >= end {
-                FIRST_CLUSTER
-            } else {
-                self.prev_free + 1
-            };
-            let mut new_clusters = Vec::with_capacity(extra);
-            let mut cursor = start_from;
-
-            while new_clusters.len() < extra {
-                match self.bitmap_find_free(cursor, end) {
-                    Some(c) => {
-                        new_clusters.push(c);
-                        cursor = c + 1;
-                    }
-                    None => break,
-                }
-            }
-            if new_clusters.len() < extra && start_from > FIRST_CLUSTER {
-                cursor = FIRST_CLUSTER;
-                while new_clusters.len() < extra {
-                    match self.bitmap_find_free(cursor, start_from) {
-                        Some(c) => {
-                            new_clusters.push(c);
-                            cursor = c + 1;
-                        }
-                        None => break,
-                    }
-                }
-            }
+            let new_clusters = self.reserve_free_clusters(extra)?;
             if new_clusters.len() < extra {
                 return Err(FatxError::DiskFull);
             }
@@ -1694,10 +1593,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             }
 
             self.write_fat_entry(last_old, FatEntry::Next(new_clusters[0]))?;
-            for i in 0..new_clusters.len() - 1 {
-                self.write_fat_entry(new_clusters[i], FatEntry::Next(new_clusters[i + 1]))?;
-            }
-            self.write_fat_entry(*new_clusters.last().unwrap(), FatEntry::EndOfChain)?;
+            self.link_allocated_clusters(&new_clusters)?;
         }
 
         let planned_chain = if clusters_needed > old_count {
@@ -1710,6 +1606,54 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             old_count,
             planned_chain.into_iter().take(clusters_needed).collect(),
         ))
+    }
+
+    fn reserve_free_clusters(&mut self, count: usize) -> Result<Vec<u32>> {
+        let end = FIRST_CLUSTER + self.total_clusters;
+        let start_from = if self.prev_free + 1 >= end {
+            FIRST_CLUSTER
+        } else {
+            self.prev_free + 1
+        };
+
+        let mut allocated = Vec::with_capacity(count);
+        let mut cursor = start_from;
+
+        while allocated.len() < count {
+            match self.bitmap_find_free(cursor, end) {
+                Some(cluster) => {
+                    allocated.push(cluster);
+                    cursor = cluster + 1;
+                }
+                None => break,
+            }
+        }
+
+        if allocated.len() < count && start_from > FIRST_CLUSTER {
+            cursor = FIRST_CLUSTER;
+            while allocated.len() < count {
+                match self.bitmap_find_free(cursor, start_from) {
+                    Some(cluster) => {
+                        allocated.push(cluster);
+                        cursor = cluster + 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        Ok(allocated)
+    }
+
+    fn link_allocated_clusters(&mut self, clusters: &[u32]) -> Result<()> {
+        if clusters.is_empty() {
+            return Err(FatxError::DiskFull);
+        }
+        for pair in clusters.windows(2) {
+            self.write_fat_entry(pair[0], FatEntry::Next(pair[1]))?;
+        }
+        self.write_fat_entry(*clusters.last().unwrap(), FatEntry::EndOfChain)?;
+        Ok(())
     }
 
     fn find_entry_in_parent_by_cluster(
@@ -2000,7 +1944,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         local_path: &std::path::Path,
         dest_path: &str,
         progress: Option<ProgressFn<'_>>,
-    ) -> Result<(usize, usize, u64)> {
+    ) -> Result<CopyStats> {
         self.copy_from_host_with_control(local_path, dest_path, progress, None, 0, 0)
     }
 
@@ -2012,7 +1956,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         should_abort: Option<&dyn Fn() -> bool>,
         flush_every_files: usize,
         flush_every_bytes: u64,
-    ) -> Result<(usize, usize, u64)> {
+    ) -> Result<CopyStats> {
         // A trailing slash means "--to is the parent"; without it, the caller
         // is naming the target directory itself and we preserve the old behavior.
         let effective_dest = if dest_path.ends_with('/') {
@@ -2045,14 +1989,13 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         self.copy_from_host_inner(local_path, &effective_dest, &mut state, 0)
     }
 
-    #[allow(clippy::type_complexity)]
     fn copy_from_host_inner(
         &mut self,
         local_path: &std::path::Path,
         dest_path: &str,
         state: &mut CopyFromHostState<'_>,
         base_bytes: u64,
-    ) -> Result<(usize, usize, u64)> {
+    ) -> Result<CopyStats> {
         use std::fs;
 
         let dest_path = if dest_path == "/" {
@@ -2121,20 +2064,20 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                 dir_count += dc;
                 total_bytes += tb;
             } else if local_child.is_file() {
-                let data = fs::read(&local_child).map_err(|e| {
+                let file = fs::File::open(&local_child).map_err(|e| {
                     FatxError::Io(std::io::Error::other(format!(
-                        "Cannot read '{}': {}",
+                        "Cannot open '{}': {}",
                         local_child.display(),
                         e
                     )))
                 })?;
-                let file_size = data.len() as u64;
+                let file_size = file.metadata().map_err(FatxError::Io)?.len();
 
                 if let Some(cb) = &state.progress {
                     cb(&fatx_child, file_size, base_bytes + total_bytes);
                 }
 
-                self.create_file(&fatx_child, &data)?;
+                self.create_file_from_reader(&fatx_child, file_size, BufReader::new(file), None)?;
                 file_count += 1;
                 total_bytes += file_size;
                 state.files_since_flush += 1;
@@ -2335,7 +2278,10 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
     pub fn stats(&self) -> Result<VolumeStats> {
         let free_clusters = self.free_cluster_count;
         let bad_clusters = self.bad_cluster_count;
-        let used_clusters = self.total_clusters - free_clusters - bad_clusters;
+        let used_clusters = self
+            .total_clusters
+            .saturating_sub(free_clusters)
+            .saturating_sub(bad_clusters);
         let cluster_size = self.superblock.cluster_size();
 
         Ok(VolumeStats {
@@ -2506,9 +2452,21 @@ fn split_path(path: &str) -> (&str, &str) {
     }
 }
 
+fn fat_type_for_cluster_estimate(cluster_estimate: u64) -> FatType {
+    if cluster_estimate >= FAT16_CLUSTER_THRESHOLD as u64 {
+        FatType::Fat32
+    } else {
+        FatType::Fat16
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_split_path() {
@@ -2516,5 +2474,53 @@ mod tests {
         assert_eq!(split_path("/bar.txt"), ("/", "bar.txt"));
         assert_eq!(split_path("bar.txt"), ("/", "bar.txt"));
         assert_eq!(split_path("/a/b/c"), ("/a/b", "c"));
+    }
+
+    #[test]
+    fn stats_saturates_when_cached_counts_are_corrupt() {
+        let tmp = NamedTempFile::new().expect("temp file");
+        let partition_size = 4 * 1024 * 1024u64;
+        let mut file = tmp.reopen().expect("reopen temp file");
+        file.set_len(partition_size).expect("set len");
+        file.seek(SeekFrom::Start(0)).expect("seek");
+
+        let mut sb = [0u8; SUPERBLOCK_SIZE as usize];
+        sb[0..4].copy_from_slice(&FATX_MAGIC);
+        sb[4..8].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        sb[8..12].copy_from_slice(&1u32.to_le_bytes());
+        sb[12..14].copy_from_slice(&1u16.to_le_bytes());
+        file.write_all(&sb).expect("write superblock");
+        file.sync_all().expect("sync");
+
+        let mut vol = FatxVolume::open(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(tmp.path())
+                .expect("open temp volume"),
+            0,
+            partition_size,
+        )
+        .expect("open volume");
+        let total = vol.total_clusters;
+
+        vol.free_cluster_count = total;
+        vol.bad_cluster_count = total;
+
+        let stats = vol.stats().expect("volume stats");
+        assert_eq!(stats.used_clusters, 0);
+        assert_eq!(stats.free_clusters, total);
+    }
+
+    #[test]
+    fn fat_type_boundary_uses_fatx_threshold() {
+        assert_eq!(
+            fat_type_for_cluster_estimate((FAT16_CLUSTER_THRESHOLD - 1) as u64),
+            FatType::Fat16
+        );
+        assert_eq!(
+            fat_type_for_cluster_estimate(FAT16_CLUSTER_THRESHOLD as u64),
+            FatType::Fat32
+        );
     }
 }

@@ -8,6 +8,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use log::{debug, info};
 
+use crate::error::FatxError;
 use crate::error::Result;
 use crate::types::*;
 
@@ -27,16 +28,16 @@ pub struct DetectedPartition {
 ///
 /// `device_size` is the total device size in bytes. On macOS you should get this
 /// via `platform::get_block_device_size()` for raw devices, since `seek(End(0))`
-/// returns 0 on `/dev/rdiskN`.  Pass 0 to auto-detect via seek (works for files).
+/// returns 0 on `/dev/rdiskN`.
 pub fn detect_xbox_partitions<T: Read + Write + Seek>(
     device: &mut T,
     device_size: u64,
 ) -> Result<Vec<DetectedPartition>> {
-    let device_size = if device_size > 0 {
-        device_size
-    } else {
-        device.seek(SeekFrom::End(0))?
-    };
+    if device_size == 0 {
+        return Err(FatxError::Other(
+            "device size must be supplied for raw devices on macOS".to_string(),
+        ));
+    }
     info!(
         "Device size: {} (0x{:X} bytes)",
         format_size(device_size),
@@ -150,8 +151,20 @@ fn probe_magic<T: Read + Seek>(device: &mut T, offset: u64) -> Result<(bool, Str
 
 /// Scan a device sector-by-sector for FATX/XTAF magic signatures.
 /// This is a brute-force approach for non-standard partition layouts.
-pub fn scan_for_fatx<T: Read + Write + Seek>(device: &mut T, max_offset: u64) -> Result<Vec<u64>> {
-    let device_size = device.seek(SeekFrom::End(0))?;
+///
+/// `device_size` is the total device size in bytes. On macOS raw devices
+/// should pass `platform::get_block_device_size()` instead of relying on
+/// `seek(End(0))`.
+pub fn scan_for_fatx<T: Read + Write + Seek>(
+    device: &mut T,
+    device_size: u64,
+    max_offset: u64,
+) -> Result<Vec<u64>> {
+    if device_size == 0 {
+        return Err(FatxError::Other(
+            "device size must be supplied for raw devices on macOS".to_string(),
+        ));
+    }
     let scan_limit = max_offset.min(device_size);
     let mut found = Vec::new();
 
@@ -190,5 +203,50 @@ pub fn format_size(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} bytes", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn detect_partitions_requires_explicit_size_when_autodetect_is_zero() {
+        let mut cursor = Cursor::new(vec![]);
+        assert!(detect_xbox_partitions(&mut cursor, 0).is_err());
+    }
+
+    #[test]
+    fn scan_for_fatx_requires_explicit_size_when_autodetect_is_zero() {
+        let mut cursor = Cursor::new(vec![]);
+        assert!(scan_for_fatx(&mut cursor, 0, 0).is_err());
+    }
+
+    #[test]
+    fn detect_partitions_finds_valid_magic_with_explicit_size() {
+        let mut image = vec![0u8; 0x90000];
+        image[0x80000..0x80004].copy_from_slice(&FATX_MAGIC);
+        let mut cursor = Cursor::new(image);
+
+        let parts = detect_xbox_partitions(&mut cursor, 0x90000).expect("detect partitions");
+        let part = parts
+            .iter()
+            .find(|part| part.offset == 0x80000)
+            .expect("360 System Cache partition");
+
+        assert!(part.has_valid_magic);
+        assert_eq!(part.magic, "FATX");
+    }
+
+    #[test]
+    fn scan_for_fatx_finds_valid_magic_with_explicit_size() {
+        let mut image = vec![0u8; 0x90000];
+        image[0x80000..0x80004].copy_from_slice(&FATX_MAGIC);
+        let mut cursor = Cursor::new(image);
+
+        let offsets = scan_for_fatx(&mut cursor, 0x90000, 0x90000).expect("scan");
+        assert!(offsets.contains(&0x80000));
     }
 }

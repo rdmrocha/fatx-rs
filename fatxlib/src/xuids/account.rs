@@ -120,17 +120,17 @@ fn read_gamertag(plaintext: &[u8]) -> Option<String> {
 /// Xbox Live gamertags: 1–15 chars, start with a letter, contain
 /// letters/digits/spaces. This guard rejects junk that happens to decrypt
 /// to non-empty UTF-16 (rare with the wrong key but possible).
-fn looks_like_gamertag(s: &str) -> bool {
+pub(crate) fn looks_like_gamertag(s: &str) -> bool {
     let len = s.chars().count();
     if !(1..=15).contains(&len) {
         return false;
     }
     let mut chars = s.chars();
     let first = chars.next().unwrap();
-    if !first.is_ascii_alphabetic() {
+    if !first.is_alphabetic() {
         return false;
     }
-    s.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ')
+    s.chars().all(|c| c.is_alphanumeric() || c == ' ')
 }
 
 #[cfg(test)]
@@ -203,6 +203,7 @@ pub(crate) mod tests {
     fn looks_like_gamertag_rules() {
         assert!(looks_like_gamertag("Bob"));
         assert!(looks_like_gamertag("MLG Pro 42"));
+        assert!(looks_like_gamertag("Игрок 7"));
         assert!(!looks_like_gamertag(""));
         assert!(!looks_like_gamertag("1Bob")); // must start with letter
         assert!(!looks_like_gamertag("WayTooLongGamertag")); // > 15 chars

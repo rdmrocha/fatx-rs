@@ -38,7 +38,11 @@ fn returns_none_for_unknown_id() {
 #[test]
 fn merged_map_coverage_floor() {
     // 5133 (360) + 990 (OG) - 613 (overlap) = 5510. Floor at 5400 for slack.
-    // ENTRY_COUNT is a const, so this is essentially a compile-time guard.
-    #[allow(clippy::assertions_on_constants)]
-    const _: () = assert!(ENTRY_COUNT >= 5400, "merged map looks too small");
+    const fn assert_title_catalog_floor(count: usize) {
+        if count < 5400 {
+            panic!("title catalog unexpectedly small");
+        }
+    }
+
+    const _: () = assert_title_catalog_floor(ENTRY_COUNT);
 }
