@@ -776,50 +776,13 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             return Err(FatxError::DiskFull);
         }
 
-        let end = FIRST_CLUSTER + self.total_clusters;
-        let start_from = if self.prev_free + 1 >= end {
-            FIRST_CLUSTER
-        } else {
-            self.prev_free + 1
-        };
-
-        let mut allocated = Vec::with_capacity(count);
-        let mut cursor = start_from;
-
-        // Pass 1: from prev_free+1 to end
-        while allocated.len() < count {
-            match self.bitmap_find_free(cursor, end) {
-                Some(cluster) => {
-                    allocated.push(cluster);
-                    cursor = cluster + 1;
-                }
-                None => break,
-            }
-        }
-
-        // Pass 2: wraparound from beginning
-        if allocated.len() < count && start_from > FIRST_CLUSTER {
-            cursor = FIRST_CLUSTER;
-            while allocated.len() < count {
-                match self.bitmap_find_free(cursor, start_from) {
-                    Some(cluster) => {
-                        allocated.push(cluster);
-                        cursor = cluster + 1;
-                    }
-                    None => break,
-                }
-            }
-        }
+        let allocated = self.reserve_free_clusters(count)?;
 
         if allocated.len() < count {
             return Err(FatxError::DiskFull);
         }
 
-        // Chain them together
-        for i in 0..allocated.len() - 1 {
-            self.write_fat_entry(allocated[i], FatEntry::Next(allocated[i + 1]))?;
-        }
-        self.write_fat_entry(*allocated.last().unwrap(), FatEntry::EndOfChain)?;
+        self.link_allocated_clusters(&allocated)?;
 
         // Update prev_free to the last allocated cluster
         self.prev_free = *allocated.last().unwrap();
@@ -1662,37 +1625,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         if clusters_needed > old_count {
             let extra = clusters_needed - old_count;
             let last_old = *old_chain.last().unwrap();
-
-            let end = FIRST_CLUSTER + self.total_clusters;
-            let start_from = if self.prev_free + 1 >= end {
-                FIRST_CLUSTER
-            } else {
-                self.prev_free + 1
-            };
-            let mut new_clusters = Vec::with_capacity(extra);
-            let mut cursor = start_from;
-
-            while new_clusters.len() < extra {
-                match self.bitmap_find_free(cursor, end) {
-                    Some(c) => {
-                        new_clusters.push(c);
-                        cursor = c + 1;
-                    }
-                    None => break,
-                }
-            }
-            if new_clusters.len() < extra && start_from > FIRST_CLUSTER {
-                cursor = FIRST_CLUSTER;
-                while new_clusters.len() < extra {
-                    match self.bitmap_find_free(cursor, start_from) {
-                        Some(c) => {
-                            new_clusters.push(c);
-                            cursor = c + 1;
-                        }
-                        None => break,
-                    }
-                }
-            }
+            let new_clusters = self.reserve_free_clusters(extra)?;
             if new_clusters.len() < extra {
                 return Err(FatxError::DiskFull);
             }
@@ -1701,10 +1634,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             }
 
             self.write_fat_entry(last_old, FatEntry::Next(new_clusters[0]))?;
-            for i in 0..new_clusters.len() - 1 {
-                self.write_fat_entry(new_clusters[i], FatEntry::Next(new_clusters[i + 1]))?;
-            }
-            self.write_fat_entry(*new_clusters.last().unwrap(), FatEntry::EndOfChain)?;
+            self.link_allocated_clusters(&new_clusters)?;
         }
 
         let planned_chain = if clusters_needed > old_count {
@@ -1717,6 +1647,54 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             old_count,
             planned_chain.into_iter().take(clusters_needed).collect(),
         ))
+    }
+
+    fn reserve_free_clusters(&mut self, count: usize) -> Result<Vec<u32>> {
+        let end = FIRST_CLUSTER + self.total_clusters;
+        let start_from = if self.prev_free + 1 >= end {
+            FIRST_CLUSTER
+        } else {
+            self.prev_free + 1
+        };
+
+        let mut allocated = Vec::with_capacity(count);
+        let mut cursor = start_from;
+
+        while allocated.len() < count {
+            match self.bitmap_find_free(cursor, end) {
+                Some(cluster) => {
+                    allocated.push(cluster);
+                    cursor = cluster + 1;
+                }
+                None => break,
+            }
+        }
+
+        if allocated.len() < count && start_from > FIRST_CLUSTER {
+            cursor = FIRST_CLUSTER;
+            while allocated.len() < count {
+                match self.bitmap_find_free(cursor, start_from) {
+                    Some(cluster) => {
+                        allocated.push(cluster);
+                        cursor = cluster + 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        Ok(allocated)
+    }
+
+    fn link_allocated_clusters(&mut self, clusters: &[u32]) -> Result<()> {
+        if clusters.is_empty() {
+            return Err(FatxError::DiskFull);
+        }
+        for pair in clusters.windows(2) {
+            self.write_fat_entry(pair[0], FatEntry::Next(pair[1]))?;
+        }
+        self.write_fat_entry(*clusters.last().unwrap(), FatEntry::EndOfChain)?;
+        Ok(())
     }
 
     fn find_entry_in_parent_by_cluster(

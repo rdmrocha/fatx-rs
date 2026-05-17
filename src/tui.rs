@@ -244,7 +244,7 @@ enum IoResp {
 // App state
 // ===========================================================================
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 enum InputMode {
     Normal,
@@ -281,6 +281,8 @@ struct App {
     cancel_flag: Arc<AtomicBool>,
     /// Pending cleanup paths awaiting user confirmation.
     pending_cleanup: Vec<(String, bool, u64)>,
+    /// Pending single-delete target captured when the prompt is opened.
+    pending_delete: Option<(String, bool)>,
     /// Local XISO path + default action stashed between the upload prompt
     /// and the three-way confirmation prompt (extract / GoD / raw).
     pending_xiso_upload: Option<(PathBuf, XisoUploadAction)>,
@@ -390,6 +392,7 @@ impl App {
             is_busy: false,
             cancel_flag,
             pending_cleanup: Vec::new(),
+            pending_delete: None,
             pending_xiso_upload: None,
             sort_mode: SortMode::ByName,
         }
@@ -1666,6 +1669,7 @@ fn handle_normal_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent)
                 };
                 app.input_prompt = msg;
                 app.input_buffer.clear();
+                app.pending_delete = Some((name, is_dir));
                 app.input_mode = InputMode::ConfirmDelete;
             }
         }
@@ -1699,225 +1703,244 @@ fn handle_input_key(app: &mut App, cmd_tx: &mpsc::Sender<IoCmd>, key: KeyEvent) 
             // If the user was answering the XISO extract/raw prompt, drop the
             // stashed path so the next upload starts clean.
             app.pending_xiso_upload = None;
+            app.pending_delete = None;
             app.set_status("Cancelled.");
         }
         KeyCode::Enter => {
             let input = app.input_buffer.clone();
+            let mode = app.input_mode;
             app.input_mode = InputMode::Normal;
 
-            // Dispatch based on what mode we were in (using the prompt to determine)
-            if app.input_prompt.starts_with("Save '") {
-                // Download
-                let name = app.selected_name().unwrap_or_default();
-                let fatx_path = app.full_path(&name);
-                let local_path = PathBuf::from(unescape_path(&input));
-                app.download_dir = local_path
-                    .parent()
-                    .unwrap_or(&PathBuf::from("."))
-                    .to_path_buf();
-                app.set_status(&format!("Downloading '{}'...", name));
-                let _ = cmd_tx.send(IoCmd::ReadFile {
-                    fatx_path,
-                    local_path,
-                });
-                app.is_busy = true;
-            } else if app.input_prompt.starts_with("Upload ") {
-                // Upload file or directory — unescape shell backslashes
-                // (e.g. Call\ of\ Duty) and trim leading/trailing whitespace
-                // (drag-and-drop into the terminal often appends a space).
-                let path = PathBuf::from(unescape_path(input.trim()));
-                if !path.exists() {
-                    app.set_error(&format!("Not found: {}", input));
-                    return;
-                }
-                let filename = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "file.dat".to_string());
-
-                if path.is_dir() {
-                    let fatx_dest = app.full_path(&filename);
-                    app.set_status(&format!("Uploading directory '{}'...", filename));
-                    let _ = cmd_tx.send(IoCmd::CopyDir {
-                        local_path: path.clone(),
-                        fatx_dest,
-                    });
-                    app.download_dir = path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
-                    app.is_busy = true;
-                } else if is_xiso(&path) {
-                    // Detected an Xbox disc image. Pick the default action
-                    // based on cwd: inside a per-user Content folder (where
-                    // GoD packages live), default to GoD; everywhere else
-                    // default to extract (works for alt dashboards).
-                    let default = if fatxlib::display::folder_slot(&app.cwd)
-                        == fatxlib::display::FolderSlot::TitleId
-                    {
-                        XisoUploadAction::God
-                    } else {
-                        XisoUploadAction::Extract
-                    };
-                    let prompt = match default {
-                        XisoUploadAction::Extract => format!(
-                            "Detected XISO '{}'. e(X)tract / (g)oD / (r)aw / Esc:",
-                            filename
-                        ),
-                        XisoUploadAction::God => format!(
-                            "Detected XISO '{}'. e(x)tract / (G)oD / (r)aw / Esc:",
-                            filename
-                        ),
-                        XisoUploadAction::Raw => format!(
-                            "Detected XISO '{}'. e(x)tract / (g)oD / (R)aw / Esc:",
-                            filename
-                        ),
-                    };
-                    app.pending_xiso_upload = Some((path.clone(), default));
-                    app.download_dir = path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
-                    app.input_mode = InputMode::ConfirmXisoUpload;
-                    app.input_prompt = prompt;
-                    app.input_buffer.clear();
-                } else {
-                    let fatx_path = app.full_path(&filename);
-                    app.set_status(&format!("Uploading '{}'...", filename));
-                    let _ = cmd_tx.send(IoCmd::WriteFile {
-                        local_path: path.clone(),
+            match mode {
+                InputMode::DownloadPath => {
+                    // Download
+                    let name = app.selected_name().unwrap_or_default();
+                    let fatx_path = app.full_path(&name);
+                    let local_path = PathBuf::from(unescape_path(&input));
+                    app.download_dir = local_path
+                        .parent()
+                        .unwrap_or(&PathBuf::from("."))
+                        .to_path_buf();
+                    app.set_status(&format!("Downloading '{}'...", name));
+                    let _ = cmd_tx.send(IoCmd::ReadFile {
                         fatx_path,
+                        local_path,
                     });
-                    app.download_dir = path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
                     app.is_busy = true;
                 }
-            } else if app.input_prompt.starts_with("Detected XISO") {
-                let (path, default) = match app.pending_xiso_upload.take() {
-                    Some(pair) => pair,
-                    None => {
-                        app.set_error("Internal: missing pending XISO path.");
+                InputMode::UploadPath => {
+                    // Upload file or directory — unescape shell backslashes
+                    // (e.g. Call\ of\ Duty) and trim leading/trailing whitespace
+                    // (drag-and-drop into the terminal often appends a space).
+                    let path = PathBuf::from(unescape_path(input.trim()));
+                    if !path.exists() {
+                        app.set_error(&format!("Not found: {}", input));
                         return;
                     }
-                };
-                let trimmed = input.trim();
-                let action = if trimmed.is_empty() {
-                    default
-                } else {
-                    match trimmed.chars().next().map(|c| c.to_ascii_lowercase()) {
-                        Some('x') => XisoUploadAction::Extract,
-                        Some('g') => XisoUploadAction::God,
-                        Some('r') => XisoUploadAction::Raw,
-                        _ => {
-                            app.set_error(&format!(
-                                "Unknown choice {:?} — expected x, g, or r.",
-                                trimmed
-                            ));
-                            return;
-                        }
-                    }
-                };
-                let filename = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "iso".to_string());
+                    let filename = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "file.dat".to_string());
 
-                match action {
-                    XisoUploadAction::Extract => {
-                        // Prefer a catalog-resolved folder name over the
-                        // local filename stem: a disc named `disc1.iso`
-                        // with TitleID 0x4D5307E6 should land at
-                        // `<cwd>/Halo 3 [4D5307E6]/` rather than `<cwd>/disc1/`.
-                        // Falls back to the file stem on catalog miss or
-                        // unreadable XEX/XBE.
-                        let stem = path
-                            .file_stem()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| filename.clone());
-                        let resolved = xiso_folder_name(&path).unwrap_or(stem);
-                        let dest_dir = app.full_path(&resolved);
-                        app.set_status(&format!("Extracting '{}' → {}...", filename, dest_dir));
-                        let _ = cmd_tx.send(IoCmd::ExtractXiso {
-                            source: path,
-                            dest_dir,
+                    if path.is_dir() {
+                        let fatx_dest = app.full_path(&filename);
+                        app.set_status(&format!("Uploading directory '{}'...", filename));
+                        let _ = cmd_tx.send(IoCmd::CopyDir {
+                            local_path: path.clone(),
+                            fatx_dest,
                         });
+                        app.download_dir =
+                            path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
                         app.is_busy = true;
-                    }
-                    XisoUploadAction::God => {
-                        let dest_dir = app.cwd.clone();
-                        app.set_status(&format!(
-                            "Converting '{}' to GoD under {}...",
-                            filename, dest_dir
-                        ));
-                        let _ = cmd_tx.send(IoCmd::ConvertXisoToGod {
-                            source: path,
-                            dest_dir,
-                        });
-                        app.is_busy = true;
-                    }
-                    XisoUploadAction::Raw => {
+                    } else if is_xiso(&path) {
+                        // Detected an Xbox disc image. Pick the default action
+                        // based on cwd: inside a per-user Content folder (where
+                        // GoD packages live), default to GoD; everywhere else
+                        // default to extract (works for alt dashboards).
+                        let default = if fatxlib::display::folder_slot(&app.cwd)
+                            == fatxlib::display::FolderSlot::TitleId
+                        {
+                            XisoUploadAction::God
+                        } else {
+                            XisoUploadAction::Extract
+                        };
+                        let prompt = match default {
+                            XisoUploadAction::Extract => format!(
+                                "Detected XISO '{}'. e(X)tract / (g)oD / (r)aw / Esc:",
+                                filename
+                            ),
+                            XisoUploadAction::God => format!(
+                                "Detected XISO '{}'. e(x)tract / (G)oD / (r)aw / Esc:",
+                                filename
+                            ),
+                            XisoUploadAction::Raw => format!(
+                                "Detected XISO '{}'. e(x)tract / (g)oD / (R)aw / Esc:",
+                                filename
+                            ),
+                        };
+                        app.pending_xiso_upload = Some((path.clone(), default));
+                        app.download_dir =
+                            path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
+                        app.input_mode = InputMode::ConfirmXisoUpload;
+                        app.input_prompt = prompt;
+                        app.input_buffer.clear();
+                    } else {
                         let fatx_path = app.full_path(&filename);
-                        app.set_status(&format!("Uploading '{}' (raw)...", filename));
+                        app.set_status(&format!("Uploading '{}'...", filename));
                         let _ = cmd_tx.send(IoCmd::WriteFile {
-                            local_path: path,
+                            local_path: path.clone(),
                             fatx_path,
                         });
+                        app.download_dir =
+                            path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
                         app.is_busy = true;
                     }
                 }
-            } else if app.input_prompt.starts_with("New directory") {
-                // Mkdir
-                if !input.is_empty() {
-                    let path = app.full_path(&input);
-                    app.set_status(&format!("Creating '{}'...", input));
-                    let _ = cmd_tx.send(IoCmd::Mkdir { path });
-                    app.is_busy = true;
+                InputMode::ConfirmXisoUpload => {
+                    let (path, default) = match app.pending_xiso_upload.take() {
+                        Some(pair) => pair,
+                        None => {
+                            app.set_error("Internal: missing pending XISO path.");
+                            return;
+                        }
+                    };
+                    let trimmed = input.trim();
+                    let action = if trimmed.is_empty() {
+                        default
+                    } else {
+                        match trimmed.chars().next().map(|c| c.to_ascii_lowercase()) {
+                            Some('x') => XisoUploadAction::Extract,
+                            Some('g') => XisoUploadAction::God,
+                            Some('r') => XisoUploadAction::Raw,
+                            _ => {
+                                app.set_error(&format!(
+                                    "Unknown choice {:?} — expected x, g, or r.",
+                                    trimmed
+                                ));
+                                return;
+                            }
+                        }
+                    };
+                    let filename = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "iso".to_string());
+
+                    match action {
+                        XisoUploadAction::Extract => {
+                            // Prefer a catalog-resolved folder name over the
+                            // local filename stem: a disc named `disc1.iso`
+                            // with TitleID 0x4D5307E6 should land at
+                            // `<cwd>/Halo 3 [4D5307E6]/` rather than `<cwd>/disc1/`.
+                            // Falls back to the file stem on catalog miss or
+                            // unreadable XEX/XBE.
+                            let stem = path
+                                .file_stem()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| filename.clone());
+                            let resolved = xiso_folder_name(&path).unwrap_or(stem);
+                            let dest_dir = app.full_path(&resolved);
+                            app.set_status(&format!("Extracting '{}' → {}...", filename, dest_dir));
+                            let _ = cmd_tx.send(IoCmd::ExtractXiso {
+                                source: path,
+                                dest_dir,
+                            });
+                            app.is_busy = true;
+                        }
+                        XisoUploadAction::God => {
+                            let dest_dir = app.cwd.clone();
+                            app.set_status(&format!(
+                                "Converting '{}' to GoD under {}...",
+                                filename, dest_dir
+                            ));
+                            let _ = cmd_tx.send(IoCmd::ConvertXisoToGod {
+                                source: path,
+                                dest_dir,
+                            });
+                            app.is_busy = true;
+                        }
+                        XisoUploadAction::Raw => {
+                            let fatx_path = app.full_path(&filename);
+                            app.set_status(&format!("Uploading '{}' (raw)...", filename));
+                            let _ = cmd_tx.send(IoCmd::WriteFile {
+                                local_path: path,
+                                fatx_path,
+                            });
+                            app.is_busy = true;
+                        }
+                    }
                 }
-            } else if app.input_prompt.starts_with("Rename '") {
-                // Rename
-                let old_name = app.selected_name().unwrap_or_default();
-                if !input.is_empty() {
-                    let path = app.full_path(&old_name);
-                    let _ = cmd_tx.send(IoCmd::Rename {
-                        path,
-                        new_name: input.clone(),
-                    });
-                    app.is_busy = true;
+                InputMode::MkdirName => {
+                    // Mkdir
+                    if !input.is_empty() {
+                        let path = app.full_path(&input);
+                        app.set_status(&format!("Creating '{}'...", input));
+                        let _ = cmd_tx.send(IoCmd::Mkdir { path });
+                        app.is_busy = true;
+                    }
                 }
-            } else if app.input_prompt.starts_with("Delete '") {
-                // Confirm delete
-                if input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes") {
-                    let name = app.selected_name().unwrap_or_default();
-                    let is_dir = app.selected_entry().map(|e| e.is_dir).unwrap_or(false);
-                    let path = app.full_path(&name);
-                    app.set_status(&format!("Deleting '{}'...", name));
-                    let _ = cmd_tx.send(IoCmd::Delete {
-                        path,
-                        recursive: is_dir,
-                    });
-                    app.is_busy = true;
-                } else {
-                    app.set_status("Delete cancelled.");
+                InputMode::RenameName => {
+                    // Rename
+                    let old_name = app.selected_name().unwrap_or_default();
+                    if !input.is_empty() {
+                        let path = app.full_path(&old_name);
+                        let _ = cmd_tx.send(IoCmd::Rename {
+                            path,
+                            new_name: input.clone(),
+                        });
+                        app.is_busy = true;
+                    }
                 }
-            } else if app.input_prompt.contains("Delete? (y/n):") {
-                // Confirm cleanup
-                if input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes") {
-                    let paths: Vec<String> = app
-                        .pending_cleanup
-                        .drain(..)
-                        .map(|(path, _, _)| path)
-                        .collect();
-                    let count = paths.len();
-                    app.set_status(&format!("Deleting {} metadata entries...", count));
-                    let _ = cmd_tx.send(IoCmd::DeleteCleanup { paths });
-                    app.is_busy = true;
-                } else {
-                    app.pending_cleanup.clear();
-                    app.set_status("Cleanup cancelled.");
+                InputMode::ConfirmDelete => {
+                    // Confirm delete
+                    if input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes") {
+                        let (name, is_dir) = match app.pending_delete.take() {
+                            Some(pair) => pair,
+                            None => {
+                                app.set_error("Internal: missing pending delete target.");
+                                return;
+                            }
+                        };
+                        let path = app.full_path(&name);
+                        app.set_status(&format!("Deleting '{}'...", name));
+                        let _ = cmd_tx.send(IoCmd::Delete {
+                            path,
+                            recursive: is_dir,
+                        });
+                        app.is_busy = true;
+                    } else {
+                        app.pending_delete = None;
+                        app.set_status("Delete cancelled.");
+                    }
                 }
+                InputMode::ConfirmCleanup => {
+                    // Confirm cleanup
+                    if input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes") {
+                        let paths: Vec<String> = app
+                            .pending_cleanup
+                            .drain(..)
+                            .map(|(path, _, _)| path)
+                            .collect();
+                        let count = paths.len();
+                        app.set_status(&format!("Deleting {} metadata entries...", count));
+                        let _ = cmd_tx.send(IoCmd::DeleteCleanup { paths });
+                        app.is_busy = true;
+                    } else {
+                        app.pending_cleanup.clear();
+                        app.set_status("Cleanup cancelled.");
+                    }
+                }
+                InputMode::Normal => {}
             }
         }
         KeyCode::Backspace => {
             app.input_buffer.pop();
         }
         KeyCode::Char(c) => {
-            if app.input_mode == InputMode::ConfirmDelete
-                || app.input_mode == InputMode::ConfirmCleanup
-                || app.input_mode == InputMode::ConfirmXisoUpload
-            {
+            if matches!(
+                app.input_mode,
+                InputMode::ConfirmDelete | InputMode::ConfirmCleanup | InputMode::ConfirmXisoUpload
+            ) {
                 app.input_buffer = c.to_string();
             } else {
                 app.input_buffer.push(c);
