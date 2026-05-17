@@ -33,9 +33,7 @@ cd xtafkit
 cargo build --release
 ```
 
-Produces a single binary: `target/release/xtafkit`.
-
-The default build links against the system OpenSSL for hardware-accelerated SHA-1 during GoD conversion. On macOS install via Homebrew (`brew install openssl@3`); on Debian/Ubuntu install `libssl-dev`. To skip the OpenSSL dependency entirely and fall back to portable Rust SHA-1, build with `cargo build --release --no-default-features`.
+Produces a single binary: `target/release/xtafkit`. No system dependencies required.
 
 ## Quick start
 

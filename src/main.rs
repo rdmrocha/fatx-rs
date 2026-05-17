@@ -415,9 +415,9 @@ fn guided_partition_selection() -> Option<SelectedPartition> {
 /// hand off to the TUI.
 fn interactive_mode() {
     println!();
-    println!("========================================");
+    println!("=================================================");
     println!("  xtafkit — Xbox FATX/XTAF filesystem workbench  ");
-    println!("========================================");
+    println!("=================================================");
     println!();
 
     let Some(sel) = guided_partition_selection() else {

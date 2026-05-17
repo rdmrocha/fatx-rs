@@ -16,7 +16,6 @@ All notable changes to `xtafkit` will be documented in this file.
 - Refactored GoD conversion to share its engine between host-filesystem and FATX-volume targets via an internal `GodSink` trait — one `run_conversion` loop, two sink implementations.
 
 ### Performance
-- Hot-path SHA-1 in GoD conversion routes through `openssl::sha::sha1` by default (ARMv8 SHA on Apple Silicon, SHA-NI on x86). Gated by the default-on `openssl-hash` cargo feature; disable to fall back to RustCrypto's `sha1` crate with zero system OpenSSL dependency.
 - Fixed a double-I/O bug in `write_part`: the upstream implementation read each subpart, hashed it, then `seek_relative`d back and re-read it via `io::copy` to write the part file. Now writes from the buffer it already has, halving I/O on the hot path (~33 % wall-time reduction on large ISOs).
 - 1 MiB `BufReader` on the source ISO during the metadata pre-pass cuts syscall tax on multi-GiB inputs.
 - Streaming variant of GoD conversion to FATX (`convert_iso_to_fatx`) builds each part in a reused ~163 MiB buffer and streams straight into the volume — no local staging.

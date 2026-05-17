@@ -42,21 +42,14 @@ mod sink_fatx;
 mod sink_host;
 
 /// Single hot-path SHA-1 entry point used by [`HashList`] and
-/// [`ConHeaderBuilder`]. With the `openssl-hash` feature (default on)
-/// this routes to `openssl::sha::sha1`, which uses ARMv8 SHA on Apple
-/// Silicon and SHA-NI on x86. Without the feature it falls back to the
-/// portable-Rust `sha1` crate.
+/// [`ConHeaderBuilder`]. Routes through the portable-Rust `sha1` crate
+/// with no system dependencies. A hardware-accelerated backend
+/// (OpenSSL) was prototyped and measured as a no-op for this workload —
+/// I/O dominates, so the simpler path stays.
 #[inline]
 pub(crate) fn sha1_digest(data: &[u8]) -> [u8; 20] {
-    #[cfg(feature = "openssl-hash")]
-    {
-        openssl::sha::sha1(data)
-    }
-    #[cfg(not(feature = "openssl-hash"))]
-    {
-        use sha1::{Digest, Sha1};
-        Sha1::digest(data).into()
-    }
+    use sha1::{Digest, Sha1};
+    Sha1::digest(data).into()
 }
 
 pub const BLOCKS_PER_PART: u64 = 0xa1c4;
