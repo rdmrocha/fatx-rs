@@ -53,8 +53,13 @@ impl ConHeaderBuilder {
         self.buffer[offset..offset + buf.len()].copy_from_slice(buf);
     }
 
-    fn write_utf16_be(&mut self, offset: usize, s: &str) {
-        for (i, c) in s.encode_utf16().chain([0]).enumerate() {
+    fn write_utf16_be(&mut self, offset: usize, s: &str, max_units: usize) {
+        for (i, c) in s
+            .encode_utf16()
+            .take(max_units.saturating_sub(1))
+            .chain([0])
+            .enumerate()
+        {
             self.write_u16_be(offset + i * 2, c);
         }
     }
@@ -99,8 +104,8 @@ impl ConHeaderBuilder {
     }
 
     pub fn with_game_title(mut self, game_title: &str) -> Self {
-        self.write_utf16_be(0x0411, game_title);
-        self.write_utf16_be(0x1691, game_title);
+        self.write_utf16_be(0x0411, game_title, 0x40);
+        self.write_utf16_be(0x1691, game_title, 0x40);
         self
     }
 
@@ -118,5 +123,18 @@ impl ConHeaderBuilder {
         self.write_bytes(0x032c, &digest);
 
         self.buffer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn game_title_is_truncated_to_field_size() {
+        let title = "X".repeat(80);
+        let bytes = ConHeaderBuilder::new().with_game_title(&title).finalize();
+        assert_eq!(&bytes[0x0411 + 126..0x0411 + 128], &[0, 0]);
+        assert_eq!(&bytes[0x1691 + 126..0x1691 + 128], &[0, 0]);
     }
 }

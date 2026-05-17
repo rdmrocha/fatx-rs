@@ -38,7 +38,6 @@ fn returns_none_for_unknown_id() {
 #[test]
 fn merged_map_coverage_floor() {
     // 5133 (360) + 990 (OG) - 613 (overlap) = 5510. Floor at 5400 for slack.
-    // ENTRY_COUNT is a const, so this is essentially a compile-time guard.
-    #[allow(clippy::assertions_on_constants)]
-    const _: () = assert!(ENTRY_COUNT >= 5400, "merged map looks too small");
+    // Compile-time guard: negative array length is a compile error.
+    const _: [(); ENTRY_COUNT - 5400] = [(); ENTRY_COUNT - 5400];
 }

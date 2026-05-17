@@ -236,7 +236,7 @@ fn guided_partition_selection() -> Option<SelectedPartition> {
     // Check for sudo
     if !running_as_root() {
         println!("[!] You're not running as root. Raw device access requires sudo.");
-        println!("    Re-run with: sudo fatx");
+        println!("    Re-run with: sudo xtafkit");
         println!();
         print!("Continue anyway? (y/n): ");
         io::stdout().flush().unwrap();

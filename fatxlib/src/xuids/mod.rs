@@ -130,7 +130,10 @@ fn scan_for_account_gamertag(bytes: &[u8]) -> Option<String> {
 fn pick_profile_name(xuid: &str, display_name: &str, title_name: &str) -> Option<String> {
     for candidate in [display_name, title_name] {
         let trimmed = candidate.trim().trim_matches('\u{FEFF}');
-        if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case(xuid) {
+        if !trimmed.is_empty()
+            && !trimmed.eq_ignore_ascii_case(xuid)
+            && account::looks_like_gamertag(trimmed)
+        {
             return Some(trimmed.to_string());
         }
     }
@@ -249,6 +252,14 @@ mod tests {
     #[test]
     fn pick_profile_name_returns_none_when_both_empty() {
         assert_eq!(pick_profile_name("E00012A9B73ABE44", "", ""), None);
+    }
+
+    #[test]
+    fn pick_profile_name_rejects_overlong_dashboard_title() {
+        assert_eq!(
+            pick_profile_name("E00012A9B73ABE44", "", "Xbox 360 Dashboard"),
+            None
+        );
     }
 
     #[test]

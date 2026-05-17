@@ -47,7 +47,7 @@ use std::io::{self, stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
 use crossterm::{
@@ -562,15 +562,16 @@ fn io_worker(
                     let size = data.len() as u64;
                     match vol.create_or_replace_file(&fatx_path, &data) {
                         Ok(_) => {
-                            let _ = vol.flush();
-                            let _ = resp_tx.send(IoResp::Done {
-                                message: format!(
-                                    "Uploaded '{}' → {} ({})",
-                                    local_path.display(),
-                                    fatx_path,
-                                    format_size(size)
-                                ),
-                            });
+                            if !flush_or_error(&mut vol, &resp_tx, "Upload flush failed") {
+                                let _ = resp_tx.send(IoResp::Done {
+                                    message: format!(
+                                        "Uploaded '{}' → {} ({})",
+                                        local_path.display(),
+                                        fatx_path,
+                                        format_size(size)
+                                    ),
+                                });
+                            }
                         }
                         Err(e) => {
                             let _ = resp_tx.send(IoResp::Error {
@@ -606,6 +607,7 @@ fn io_worker(
                 let mut bytes_done = 0u64;
                 let mut files_done = 0usize;
                 let mut cancelled = false;
+                let mut failed = false;
                 let mut files_since_flush = 0usize;
                 let mut bytes_since_flush = 0u64;
 
@@ -661,11 +663,8 @@ fn io_worker(
                     }
 
                     if files_since_flush >= 100 || bytes_since_flush >= 256 * 1024 * 1024 {
-                        if let Err(e) = vol.flush() {
-                            let _ = resp_tx.send(IoResp::Error {
-                                message: format!("Periodic flush failed: {}", e),
-                            });
-                            cancelled = true;
+                        if flush_or_error(&mut vol, &resp_tx, "Periodic flush failed") {
+                            failed = true;
                             break;
                         }
                         files_since_flush = 0;
@@ -673,7 +672,9 @@ fn io_worker(
                     }
                 }
 
-                let _ = vol.flush();
+                if flush_or_error(&mut vol, &resp_tx, "Final flush failed") {
+                    failed = true;
+                }
 
                 if cancelled {
                     let _ = resp_tx.send(IoResp::Cancelled {
@@ -684,6 +685,8 @@ fn io_worker(
                             format_size(bytes_done)
                         ),
                     });
+                } else if failed {
+                    // Error already reported by flush_or_error.
                 } else {
                     let _ = resp_tx.send(IoResp::Done {
                         message: format!(
@@ -818,10 +821,7 @@ fn io_worker(
 
                     // Flush periodically so a long extract survives a yank.
                     if files_since_flush >= 100 || bytes_since_flush >= 256 * 1024 * 1024 {
-                        if let Err(e) = vol.flush() {
-                            let _ = resp_tx.send(IoResp::Error {
-                                message: format!("Periodic flush failed: {}", e),
-                            });
+                        if flush_or_error(&mut vol, &resp_tx, "Periodic flush failed") {
                             failed = true;
                             break;
                         }
@@ -830,7 +830,9 @@ fn io_worker(
                     }
                 }
 
-                let _ = vol.flush();
+                if flush_or_error(&mut vol, &resp_tx, "Final flush failed") {
+                    failed = true;
+                }
 
                 if cancelled {
                     let _ = resp_tx.send(IoResp::Cancelled {
@@ -987,7 +989,9 @@ fn io_worker(
                     &source, &mut vol, &dest_dir, &mut opts,
                 ) {
                     Ok(r) => {
-                        let _ = vol.flush();
+                        if flush_or_error(&mut vol, &resp_tx, "GoD flush failed") {
+                            continue;
+                        }
                         // Rough total: per-part overhead (4 KiB master +
                         // 4 KiB × subparts) plus the CON header. Reporting
                         // the source-side data size is close enough.
@@ -1004,7 +1008,7 @@ fn io_worker(
                         });
                     }
                     Err(e) => {
-                        let _ = vol.flush();
+                        let _ = flush_or_error(&mut vol, &resp_tx, "GoD flush failed");
                         let msg = format!("{}", e);
                         if msg.contains("cancelled") {
                             let _ = resp_tx.send(IoResp::Cancelled {
@@ -1021,10 +1025,11 @@ fn io_worker(
 
             IoCmd::Mkdir { path } => match vol.create_directory(&path) {
                 Ok(_) => {
-                    let _ = vol.flush();
-                    let _ = resp_tx.send(IoResp::Done {
-                        message: format!("Created directory '{}'", path),
-                    });
+                    if !flush_or_error(&mut vol, &resp_tx, "Mkdir flush failed") {
+                        let _ = resp_tx.send(IoResp::Done {
+                            message: format!("Created directory '{}'", path),
+                        });
+                    }
                 }
                 Err(e) => {
                     let _ = resp_tx.send(IoResp::Error {
@@ -1041,10 +1046,11 @@ fn io_worker(
                 };
                 match result {
                     Ok(_) => {
-                        let _ = vol.flush();
-                        let _ = resp_tx.send(IoResp::Done {
-                            message: format!("Deleted '{}'", path),
-                        });
+                        if !flush_or_error(&mut vol, &resp_tx, "Delete flush failed") {
+                            let _ = resp_tx.send(IoResp::Done {
+                                message: format!("Deleted '{}'", path),
+                            });
+                        }
                     }
                     Err(e) => {
                         let _ = resp_tx.send(IoResp::Error {
@@ -1056,10 +1062,11 @@ fn io_worker(
 
             IoCmd::Rename { path, new_name } => match vol.rename(&path, &new_name) {
                 Ok(_) => {
-                    let _ = vol.flush();
-                    let _ = resp_tx.send(IoResp::Done {
-                        message: format!("Renamed → '{}'", new_name),
-                    });
+                    if !flush_or_error(&mut vol, &resp_tx, "Rename flush failed") {
+                        let _ = resp_tx.send(IoResp::Done {
+                            message: format!("Renamed → '{}'", new_name),
+                        });
+                    }
                 }
                 Err(e) => {
                     let _ = resp_tx.send(IoResp::Error {
@@ -1121,15 +1128,16 @@ fn io_worker(
                         }
                     }
                 }
-                let _ = vol.flush();
-                let _ = resp_tx.send(IoResp::Done {
-                    message: format!(
-                        "Removed {} file(s), {} dir(s), freed {}",
-                        files,
-                        dirs,
-                        format_size(bytes)
-                    ),
-                });
+                if !flush_or_error(&mut vol, &resp_tx, "Cleanup flush failed") {
+                    let _ = resp_tx.send(IoResp::Done {
+                        message: format!(
+                            "Removed {} file(s), {} dir(s), freed {}",
+                            files,
+                            dirs,
+                            format_size(bytes)
+                        ),
+                    });
+                }
             }
 
             IoCmd::ResolveTitle { path } => {
@@ -1168,7 +1176,9 @@ fn io_worker(
             }
 
             IoCmd::Flush => {
-                let _ = vol.flush();
+                if flush_or_error(&mut vol, &resp_tx, "Flush failed") {
+                    continue;
+                }
                 let _ = resp_tx.send(IoResp::Flushed);
             }
 
@@ -1261,6 +1271,42 @@ fn create_dirs_recursive(vol: &mut FatxVolume<std::fs::File>, local_dir: &PathBu
     }
 }
 
+fn flush_or_error(
+    vol: &mut FatxVolume<std::fs::File>,
+    resp_tx: &mpsc::Sender<IoResp>,
+    context: &str,
+) -> bool {
+    match vol.flush() {
+        Ok(()) => false,
+        Err(e) => {
+            let _ = resp_tx.send(IoResp::Error {
+                message: format!("{}: {}", context, e),
+            });
+            true
+        }
+    }
+}
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = stdout().execute(LeaveAlternateScreen);
+        let _ = stdout().execute(Show);
+    }
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_raw_mode();
+        let _ = stdout().execute(LeaveAlternateScreen);
+        let _ = stdout().execute(Show);
+        default_hook(panic_info);
+    }));
+}
+
 // ===========================================================================
 // Main entry point
 // ===========================================================================
@@ -1283,9 +1329,11 @@ pub fn run_browser(
     });
 
     // Setup terminal
+    install_panic_hook();
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let _terminal_guard = TerminalGuard;
 
     let mut app = App::new(partition_name, device_display, Arc::clone(&cancel_flag));
 
@@ -1311,8 +1359,17 @@ pub fn run_browser(
         }
 
         // Process all pending I/O responses (non-blocking)
-        while let Ok(resp) = resp_rx.try_recv() {
-            handle_io_response(&mut app, &cmd_tx, resp);
+        loop {
+            match resp_rx.try_recv() {
+                Ok(resp) => handle_io_response(&mut app, &cmd_tx, resp),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    app.is_busy = false;
+                    app.should_quit = true;
+                    app.set_error("I/O worker stopped unexpectedly");
+                    break;
+                }
+            }
         }
 
         // Poll for key events (50ms timeout — ~20fps refresh)
@@ -1337,11 +1394,6 @@ pub fn run_browser(
     // Shutdown I/O worker
     let _ = cmd_tx.send(IoCmd::Shutdown);
     let _ = worker_handle.join();
-
-    // Restore terminal
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
-
     Ok(())
 }
 

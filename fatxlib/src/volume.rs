@@ -4,7 +4,7 @@
 //! and provides methods to navigate directories, read files, and perform write operations.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 
 use log::{info, warn};
 
@@ -61,6 +61,7 @@ pub struct FatxVolume<T: Read + Write + Seek> {
 
 /// Progress callback: `(fatx_path, file_size, total_bytes_so_far)`.
 type ProgressFn<'a> = &'a dyn Fn(&str, u64, u64);
+type CopyStats = (usize, usize, u64);
 
 struct CopyFromHostState<'a> {
     progress: Option<ProgressFn<'a>>,
@@ -104,11 +105,17 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
     ///
     /// - `inner`: A seekable read/write handle to the device or image file.
     /// - `partition_offset`: Byte offset where the FATX partition begins.
-    /// - `partition_size`: Size of the partition in bytes (0 = auto-detect from stream length).
+    /// - `partition_size`: Size of the partition in bytes.
+    ///   Pass the explicit size for raw block devices on macOS.
     pub fn open(mut inner: T, partition_offset: u64, partition_size: u64) -> Result<Self> {
         // Determine actual partition size if not provided.
         let partition_size = if partition_size == 0 {
             let end = inner.seek(SeekFrom::End(0))?;
+            if end == 0 {
+                return Err(FatxError::Other(
+                    "partition size must be supplied for raw devices on macOS".to_string(),
+                ));
+            }
             end.saturating_sub(partition_offset)
         } else {
             partition_size
@@ -192,7 +199,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         //   if (total_sectors - 260) / sectors_per_cluster >= 65525 => FAT32
         // The "260" accounts for the root directory overhead estimate.
         let cluster_estimate = total_sectors.saturating_sub(260) / spc;
-        let fat_type = if cluster_estimate >= 65_525 {
+        let fat_type = if cluster_estimate >= FAT16_CLUSTER_THRESHOLD as u64 {
             FatType::Fat32
         } else {
             FatType::Fat16
@@ -2000,7 +2007,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         local_path: &std::path::Path,
         dest_path: &str,
         progress: Option<ProgressFn<'_>>,
-    ) -> Result<(usize, usize, u64)> {
+    ) -> Result<CopyStats> {
         self.copy_from_host_with_control(local_path, dest_path, progress, None, 0, 0)
     }
 
@@ -2012,7 +2019,7 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         should_abort: Option<&dyn Fn() -> bool>,
         flush_every_files: usize,
         flush_every_bytes: u64,
-    ) -> Result<(usize, usize, u64)> {
+    ) -> Result<CopyStats> {
         // A trailing slash means "--to is the parent"; without it, the caller
         // is naming the target directory itself and we preserve the old behavior.
         let effective_dest = if dest_path.ends_with('/') {
@@ -2045,14 +2052,13 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
         self.copy_from_host_inner(local_path, &effective_dest, &mut state, 0)
     }
 
-    #[allow(clippy::type_complexity)]
     fn copy_from_host_inner(
         &mut self,
         local_path: &std::path::Path,
         dest_path: &str,
         state: &mut CopyFromHostState<'_>,
         base_bytes: u64,
-    ) -> Result<(usize, usize, u64)> {
+    ) -> Result<CopyStats> {
         use std::fs;
 
         let dest_path = if dest_path == "/" {
@@ -2121,20 +2127,20 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
                 dir_count += dc;
                 total_bytes += tb;
             } else if local_child.is_file() {
-                let data = fs::read(&local_child).map_err(|e| {
+                let file = fs::File::open(&local_child).map_err(|e| {
                     FatxError::Io(std::io::Error::other(format!(
-                        "Cannot read '{}': {}",
+                        "Cannot open '{}': {}",
                         local_child.display(),
                         e
                     )))
                 })?;
-                let file_size = data.len() as u64;
+                let file_size = file.metadata().map_err(FatxError::Io)?.len();
 
                 if let Some(cb) = &state.progress {
                     cb(&fatx_child, file_size, base_bytes + total_bytes);
                 }
 
-                self.create_file(&fatx_child, &data)?;
+                self.create_file_from_reader(&fatx_child, file_size, BufReader::new(file), None)?;
                 file_count += 1;
                 total_bytes += file_size;
                 state.files_since_flush += 1;
@@ -2335,7 +2341,10 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
     pub fn stats(&self) -> Result<VolumeStats> {
         let free_clusters = self.free_cluster_count;
         let bad_clusters = self.bad_cluster_count;
-        let used_clusters = self.total_clusters - free_clusters - bad_clusters;
+        let used_clusters = self
+            .total_clusters
+            .saturating_sub(free_clusters)
+            .saturating_sub(bad_clusters);
         let cluster_size = self.superblock.cluster_size();
 
         Ok(VolumeStats {
@@ -2348,6 +2357,12 @@ impl<T: Read + Write + Seek> FatxVolume<T> {
             free_size: free_clusters as u64 * cluster_size,
             used_size: used_clusters as u64 * cluster_size,
         })
+    }
+
+    #[doc(hidden)]
+    pub fn force_stats_counts_for_test(&mut self, free_clusters: u32, bad_clusters: u32) {
+        self.free_cluster_count = free_clusters;
+        self.bad_cluster_count = bad_clusters;
     }
 }
 
